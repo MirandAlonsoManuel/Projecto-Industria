@@ -208,6 +208,21 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
     redrawCanvas(canvas, rois, selectedId, cameraId, previewRef.current);
   }, [rois, selectedId, cameraId]);
 
+  useEffect(() => {
+    console.table(
+      rois.map((roi) => ({
+        id: roi.id,
+        cameraId: roi.cameraId,
+        label: roi.label,
+        x: roi.x,
+        y: roi.y,
+        width: roi.width,
+        height: roi.height,
+        isEnabled: roi.isEnabled,
+      }))
+    );
+  }, [rois]);
+
   // T-21: Keyboard shortcuts
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
