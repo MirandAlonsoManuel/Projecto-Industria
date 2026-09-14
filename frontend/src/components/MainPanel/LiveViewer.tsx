@@ -47,7 +47,7 @@ export function LiveViewer({
   const { canvasRef, isConnected, error, displaySize } = useCameraStream(cameraId);
 
   return (
-    <div className="flex flex-col items-center gap-4 min-h-0">
+    <div className="flex flex-col items-center gap-1 min-h-0 mt-10">
 
       {/* TopBar ahora vive aquí */}
       <TopBar
@@ -93,10 +93,11 @@ export function LiveViewer({
             </select>
           </>
         }
+        camera = {camera}
       />
 
       {/* Canvas container — igual que antes */}
-      <div className="relative w-full flex-1 bg-[#1f2430] rounded-[10px] overflow-hidden flex items-center justify-center">
+      <div className="relative w-full aspect-video bg-[#B1B0B0] rounded-[10px] overflow-hidden flex items-center justify-center">
         {error && <div className="text-sm font-semibold text-[#d64545]">{error}</div>}
         {!isConnected && !error && (
           <div className="text-[13px] text-[#6b7280]">Conectando stream…</div>

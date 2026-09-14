@@ -6,7 +6,6 @@ import { useCameraSignal } from '../../hooks/useCameraSignal';
 import { useModels } from '../../hooks/useModels';
 import { LeftSideBar } from './LeftSidebar';
 import { LiveViewer } from './LiveViewer';
-import { TopBar } from '../Toolbar';
 import { ResultsHistoryPanel, type ResultHistoryItem } from './ResultsHistoryPanel';
 
 const FALLBACK_CAMERA: Camera = {

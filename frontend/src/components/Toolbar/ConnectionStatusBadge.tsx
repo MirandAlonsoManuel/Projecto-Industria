@@ -23,12 +23,12 @@ interface ConnectionStatusBadgeProps {
 }
 
 const badgeClasses =
-  'inline-flex select-none items-center gap-[7px] rounded-full bg-[#f1f2f4] px-3 py-1 text-xs font-semibold';
+  'inline-flex select-none items-center gap-[7px] rounded-full bg-[#ffffff] px-5 py-1.5 text-xs font-semibold';
 
 const dotBaseClasses = 'h-[9px] w-[9px] shrink-0 rounded-full';
 
 const dotColorClasses: Record<CameraConnectionStatus, string> = {
-  connected: 'bg-[#1e9e63] shadow-[0_0_0_3px_rgba(30,158,99,0.18)]',
+  connected: 'bg-[#BFDA98] shadow-[#BFDA98]',
   connecting: 'bg-[#e0a020] shadow-[0_0_0_3px_rgba(224,160,32,0.18)]',
   disconnecting: 'bg-[#e0a020] shadow-[0_0_0_3px_rgba(224,160,32,0.18)]',
   disconnected: 'bg-[#9aa3af]',
@@ -55,26 +55,62 @@ export function ConnectionStatusBadge({
   compact = false,
 }: ConnectionStatusBadgeProps) {
   const meta = STATUS_META[status];
-  const isPulsing = status === 'connecting' || status === 'disconnecting';
+  const isPulsing =
+    status === 'connecting' || status === 'disconnecting';
 
   return (
-    <span
-      className={badgeClasses}
-      role="status"
-      aria-live="polite"
-      aria-label={`Estado de cámara: ${meta.label}`}
-    >
+    <div className="relative inline-block group">
+
+      {/* Badge */}
       <span
-        className={`${dotBaseClasses} ${dotColorClasses[status]} ${isPulsing ? pulsingClass : ''}`}
-      />
-      {!compact && (
-        <span className={labelClasses}>
-          {meta.label}
-          {cameraName && status === 'connected' && (
-            <span className={cameraNameClasses}> — {cameraName}</span>
-          )}
-        </span>
-      )}
-    </span>
+        className={badgeClasses}
+        role="status"
+        aria-live="polite"
+        aria-label={`Estado de cámara: ${meta.label}`}
+      >
+        <span
+          className={`${dotBaseClasses} ${
+            dotColorClasses[status]
+          } ${isPulsing ? pulsingClass : ''}`}
+        />
+
+        {!compact && (
+          <span className={labelClasses}>
+            {meta.label}
+
+            {cameraName && status === 'connected' && (
+              <span className={cameraNameClasses}>
+                {' | '}
+                {cameraName}
+              </span>
+            )}
+          </span>
+        )}
+      </span>
+
+      {/* Popover */}
+      <div
+        className="absolute bottom-full left-1/2 z-50 mb-1.5 w-full -translate-x-1/2 translate-y-2 rounded-2xl bg-white p-3 shadow-lg opacity-0 invisible transition-all duration-200 group-hover:visible group-hover:opacity-100 group-hover:translate-y-0"
+      >
+        <h5 className="text-center font-bold text-[#393939] text-[12px]">
+          Cámara
+        </h5>
+
+        <div className="flex justify-between border-b border-gray-200 py-0 text-[10px]">
+          <span className='font-semibold'>Cámara actual</span>
+          <span className='font-light'>{cameraName ?? 'Sin cámara'}</span>
+        </div>
+
+        <div className="flex justify-between border-b border-gray-200 py-0 text-[10px]">
+          <span className='font-semibold'>Dirección IP</span>
+          <span className='font-light'></span>
+        </div>
+
+        <div className="flex justify-between py-0 text-[10px]">
+          <span className='font-semibold'>Resolución y FPS</span>
+          <span className='font-light'>1920 × 1080, 30</span>
+        </div>
+      </div>
+    </div>
   );
 }
