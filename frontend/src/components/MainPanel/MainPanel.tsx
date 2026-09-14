@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import type { Camera, CameraProtocol, ROI, Job, Model } from '../../types/index';
-import type { ApiModel } from '../../types';
+import type { Camera, CameraProtocol, ROI, Job } from '../../types/index';
 import { getCameras, type ApiCamera } from '../../services/cameraApi';
 import { useCameraSignal } from '../../hooks/useCameraSignal';
 import { useModels } from '../../hooks/useModels';
@@ -28,13 +27,6 @@ const mockResults: ResultHistoryItem[] = [
   { frameId: 'f-1.000', result: 'ok', timestamp: Date.now() - 40_000 },
 ];
 
-const TASK_LABELS: Record<string, string> = {
-  localization: 'Detección YOLO',
-  classification: 'Clasificación',
-  ocr: 'OCR',
-  anomaly: 'Anomalías',
-};
-
 const KNOWN_PROTOCOLS: CameraProtocol[] = [
   'usb3',
   'usb2',
@@ -61,18 +53,6 @@ function apiCameraToCamera(apiCam: ApiCamera, status: Camera['status']): Camera 
     fps: FALLBACK_CAMERA.fps,
     status,
     isActive: status === 'connected',
-  };
-}
-
-// Convierte ApiModel (respuesta de /models) al tipo interno Model usado por la UI
-function apiModelToModel(m: ApiModel): Model {
-  return {
-    id: m.id,
-    name: `${TASK_LABELS[m.task] ?? m.task} — ${m.id}`,
-    architecture: 'yolov8',
-    classes: [],
-    confidenceThreshold: 0.25,
-    isActive: m.default && m.available && m.enabled,
   };
 }
 
@@ -129,18 +109,6 @@ function MainPanel() {
     ? apiCameraToCamera(activeApiCamera, hasSignal ? 'connected' : 'disconnected')
     : { ...FALLBACK_CAMERA, status: hasSignal ? 'connected' : 'disconnected', isActive: hasSignal };
 
-  const activeApiModel = models.find((m) => m.id === effectiveModelId) ?? null;
-  const model: Model = activeApiModel
-    ? apiModelToModel(activeApiModel)
-    : {
-        id: effectiveModelId || 'none',
-        name: isLoadingModels ? 'Cargando modelos…' : 'Sin modelo',
-        architecture: 'yolov8',
-        classes: [],
-        confidenceThreshold: 0.25,
-        isActive: false,
-      };
-
   const toggleInspection = () => {
     setJob((prev) => ({
       ...prev,
@@ -170,7 +138,11 @@ function MainPanel() {
       )}
 
       <div className="flex-1 grid grid-cols-[260px_1fr_280px] gap-4 p-4 min-h-0">
-        <LeftSideBar camera={camera} model={model} rois={mockRois} />
+        <LeftSideBar
+          cameraId={effectiveCameraId}
+          naturalWidth={camera.resolution.width}
+          naturalHeight={camera.resolution.height}
+        />
         <LiveViewer
           camera={camera}
           cameraId={effectiveCameraId}

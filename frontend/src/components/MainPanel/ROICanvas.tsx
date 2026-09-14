@@ -1,8 +1,4 @@
-/**
- * T-18 + T-20 + T-21 + T-22 + T-23: Pure Canvas 2D ROI Editor
- * Draws ROIs as normalized 0-1 coords, handles draw / select / drag / resize.
- * Label editor rendered as a small HTML overlay below the canvas.
- */
+// Función que permite guardar las coordenadas del ROI.
 import { useEffect, useRef } from 'react';
 import { useROIStore } from '../../store/roiStore';
 import type { StoredROI } from '../../store/roiStore';
@@ -14,17 +10,15 @@ interface ROICanvasProps {
 }
 
 const HANDLE_SIZE = 8;
-const MIN_PX = 10; // minimum rect size in pixels to register as ROI
-const MIN_NORM = 0.02; // minimum normalized size
+const MIN_PX = 10; // Tamaño mínimo en píxeles para crear un ROI
+const MIN_NORM = 0.02; // Tamaño mínimo normalizado
 
-// ---------------------------------------------------------------------------
-// Geometry helpers
-// ---------------------------------------------------------------------------
+// Funciones auxiliares para la detección de colisiones y manipulación de los manejadores de las ROI.
 function hitTest(roi: StoredROI, nx: number, ny: number): boolean {
   return nx >= roi.x && nx <= roi.x + roi.width && ny >= roi.y && ny <= roi.y + roi.height;
 }
 
-type HandleIndex = 0 | 1 | 2 | 3; // TL, TR, BR, BL
+type HandleIndex = 0 | 1 | 2 | 3; // Superior izquierda, superior derecha, inferior derecha, inferior izquierda
 
 function getHandleNorm(roi: StoredROI, handle: HandleIndex): { hx: number; hy: number } {
   const corners: [number, number][] = [
@@ -56,7 +50,7 @@ function hitTestHandle(
 }
 
 // ---------------------------------------------------------------------------
-// Canvas drawing
+// Dibujo del canvas
 // ---------------------------------------------------------------------------
 function redrawCanvas(
   canvas: HTMLCanvasElement,
@@ -81,11 +75,11 @@ function redrawCanvas(
     const ph = roi.height * h;
     const isSelected = roi.id === selectedId;
 
-    // Fill
+    // Relleno de la zona
     ctx.fillStyle = hexToRgba(roi.color, 0.12);
     ctx.fillRect(px, py, pw, ph);
 
-    // Border
+    // Borde de la zona
     ctx.strokeStyle = roi.color;
     ctx.lineWidth = isSelected ? 2.5 : 1.5;
     if (isSelected) {
@@ -95,7 +89,7 @@ function redrawCanvas(
     }
     ctx.strokeRect(px, py, pw, ph);
 
-    // Label
+    // Etiqueta de la zona
     if (roi.label) {
       ctx.font = 'bold 11px sans-serif';
       const tw = ctx.measureText(roi.label).width;
@@ -105,7 +99,7 @@ function redrawCanvas(
       ctx.fillText(roi.label, px + 3, py - 3);
     }
 
-    // Corner handles (only when selected)
+    // Manejadores de las esquinas cuando el ROI está seleccionado
     if (isSelected) {
       ctx.fillStyle = '#fff';
       ctx.strokeStyle = roi.color;
@@ -124,7 +118,7 @@ function redrawCanvas(
     }
   }
 
-  // Draw preview while user is drawing a new ROI
+  // Vista previa mientras se dibuja un ROI nuevo
   if (previewRect) {
     const px = previewRect.x * w;
     const py = previewRect.y * h;
@@ -148,7 +142,7 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Interaction state types
+// Tipos para controlar la interacción
 // ---------------------------------------------------------------------------
 interface NormRect {
   x: number;
@@ -171,7 +165,7 @@ type DragMode =
   | { kind: 'resizing'; roiId: string; handle: HandleIndex; origRoi: StoredROI };
 
 // ---------------------------------------------------------------------------
-// Component
+// Componente
 // ---------------------------------------------------------------------------
 export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -192,7 +186,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
 
   const selectedRoi = rois.find((r) => r.id === selectedId) ?? null;
 
-  // Set canvas dimensions when props change and redraw
+  // Ajusta el tamaño del canvas y lo vuelve a dibujar cuando cambian sus propiedades
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -201,7 +195,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
     redrawCanvas(canvas, rois, selectedId, cameraId, previewRef.current);
   }, [width, height, cameraId, rois, selectedId]);
 
-  // Redraw when rois or selectedId changes
+  // Redibuja el canvas cuando cambian los ROIs o la selección
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -223,7 +217,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
     );
   }, [rois]);
 
-  // T-21: Keyboard shortcuts
+  // Atajos de teclado para eliminar, deshacer y rehacer cambios
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -265,7 +259,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
 
     const cameraRois = rois.filter((r) => r.cameraId === cameraId);
 
-    // Check handle hit first (only on selected ROI)
+    // Primero comprueba si se hizo clic en un manejador del ROI seleccionado
     if (selectedId) {
       const selRoi = cameraRois.find((r) => r.id === selectedId);
       if (selRoi) {
@@ -282,7 +276,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
       }
     }
 
-    // Check ROI body hit (iterate in reverse for top-most)
+    // Después comprueba si se hizo clic dentro de algún ROI visible
     for (let i = cameraRois.length - 1; i >= 0; i--) {
       const roi = cameraRois[i];
       if (hitTest(roi, nx, ny)) {
@@ -299,7 +293,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
       }
     }
 
-    // Start drawing new ROI
+    // Si no se encontró un ROI, comienza a dibujar uno nuevo
     selectRoi(null);
     dragRef.current = { kind: 'drawing', startNx: nx, startNy: ny };
     previewRef.current = { x: nx, y: ny, width: 0, height: 0 };
@@ -342,7 +336,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
       const h = drag.handle;
 
       if (h === 0) {
-        // TL
+        // Esquina superior izquierda
         const newX = Math.min(orig.x + orig.width - MIN_NORM, nx);
         const newY = Math.min(orig.y + orig.height - MIN_NORM, ny);
         width = orig.x + orig.width - newX;
@@ -350,24 +344,24 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
         x = newX;
         y = newY;
       } else if (h === 1) {
-        // TR
+        // Esquina superior derecha
         const newY = Math.min(orig.y + orig.height - MIN_NORM, ny);
         width = Math.max(MIN_NORM, nx - orig.x);
         height = orig.y + orig.height - newY;
         y = newY;
       } else if (h === 2) {
-        // BR
+        // Esquina inferior derecha
         width = Math.max(MIN_NORM, nx - orig.x);
         height = Math.max(MIN_NORM, ny - orig.y);
       } else {
-        // BL
+        // Esquina inferior izquierda
         const newX = Math.min(orig.x + orig.width - MIN_NORM, nx);
         width = orig.x + orig.width - newX;
         height = Math.max(MIN_NORM, ny - orig.y);
         x = newX;
       }
 
-      // Clamp
+      // Mantiene las coordenadas dentro de los límites del canvas
       x = Math.max(0, Math.min(1 - MIN_NORM, x));
       y = Math.max(0, Math.min(1 - MIN_NORM, y));
       width = Math.max(MIN_NORM, Math.min(1 - x, width));
@@ -390,7 +384,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
 
       previewRef.current = null;
 
-      // Only create ROI if large enough (both px dimensions > MIN_PX)
+      // Solo crea el ROI si supera el tamaño mínimo en ambas dimensiones
       if (w * canvas.width > MIN_PX && h * canvas.height > MIN_PX) {
         addRoi({ cameraId, label: 'ROI', x, y, width: w, height: h, isEnabled: true });
       } else {
@@ -422,7 +416,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
         onMouseUp={onMouseUp}
       />
 
-      {/* T-22 + T-23: Label editor overlay */}
+      {/* T-22 + T-23: Editor de etiqueta sobre el canvas */}
       {selectedRoi && (
         <div
           style={{
@@ -444,7 +438,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
             value={selectedRoi.label}
             onChange={(ev) => {
               const val = ev.target.value;
-              // Live update without history; setLabel on blur
+              // Actualiza la etiqueta mientras se escribe y la confirma al perder el foco
               useROIStore.getState().updateRoiDirect(selectedRoi.id, { label: val });
             }}
             onBlur={(ev) => {

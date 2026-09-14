@@ -13,11 +13,17 @@ export function ROICoordinatesPanel({
   naturalWidth  = 1920,
   naturalHeight = 1080,
 }: ROICoordinatesPanelProps) {
-  const rois       = useROIStore(s => s.rois.filter(r => r.cameraId === cameraId));
+  const allRois = useROIStore(s => s.rois);           // referencia estable
+  const rois    = allRois.filter(r => r.cameraId === cameraId);  // fuera del store
   const selectedId = useROIStore(s => s.selectedId);
+  const undo = useROIStore(s => s.undo);
+  const redo = useROIStore(s => s.redo);
+  const canUndo = useROIStore(s => s.past.length > 0);
+  const canRedo = useROIStore(s => s.future.length > 0);
+  const deleteROI = useROIStore(s => s.deleteRoi);
 
   return (
-    <section className="bg-white border border-[#e2e5ea] rounded-2xl py-3.5 px-4 flex flex-col gap-2">
+    <section className="bg-white border border-[#e2e5ea] rounded-2xl py-3.5 px-4 flex flex-col gap-2 max-h-[60vh]">
       <p className="text-xs font-semibold uppercase tracking-[0.04em] text-[#6b7280]">
         Coordenadas ROI
       </p>
@@ -25,6 +31,33 @@ export function ROICoordinatesPanel({
       {rois.length === 0 && (
         <p className="text-[12px] text-[#9aa3af]">Sin zonas definidas</p>
       )}
+
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={undo}
+          disabled={!canUndo}
+          title="Deshacer (Ctrl+Z)"
+          className="flex-1 flex items-center justify-center gap-1 h-7 rounded-lg border
+               border-[#e2e5ea] text-[12px] text-[#1f2430] bg-white
+               disabled:opacity-40 disabled:cursor-not-allowed
+               hover:enabled:bg-[#f5f6f8] transition-colors"
+        >
+          ↩ Deshacer
+        </button>
+        <button
+          type="button"
+          onClick={redo}
+          disabled={!canRedo}
+          title="Rehacer (Ctrl+Y)"
+          className="flex-1 flex items-center justify-center gap-1 h-7 rounded-lg border
+               border-[#e2e5ea] text-[12px] text-[#1f2430] bg-white
+               disabled:opacity-40 disabled:cursor-not-allowed
+               hover:enabled:bg-[#f5f6f8] transition-colors"
+        >
+          ↪ Rehacer
+        </button>
+      </div>
 
       {rois.map((roi) => {
         const nat = { width: naturalWidth, height: naturalHeight };
@@ -42,14 +75,23 @@ export function ROICoordinatesPanel({
           >
             {/* Etiqueta + dot de color */}
             <div className="flex items-center gap-1.5 mb-1.5">
-              <span
-                className="w-2 h-2 rounded-full shrink-0"
-                style={{ background: roi.color }}
-              />
-              <span className="font-semibold text-[#1f2430] truncate">{roi.label}</span>
+              <span className="w-2 h-2 rounded-full shrink-0" style={{ background: roi.color }} />
+              <span className="font-semibold text-[#1f2430] truncate flex-1">{roi.label}</span>
               {!roi.isEnabled && (
-                <span className="ml-auto text-[10px] text-[#9aa3af]">Desactivada</span>
+                <span className="text-[10px] text-[#9aa3af]">Desactivada</span>
               )}
+
+              {/* ← AGREGAR este botón */}
+              <button
+                type="button"
+                onClick={() => deleteROI(roi.id)}
+                title="Eliminar zona"
+                className="ml-auto w-5 h-5 flex items-center justify-center rounded
+                          text-[#9aa3af] hover:text-[#d64545] hover:bg-[rgba(214,69,69,0.08)]
+                          transition-colors text-[14px] leading-none"
+              >
+                ×
+              </button>
             </div>
 
             {/* Coordenadas normalizadas */}

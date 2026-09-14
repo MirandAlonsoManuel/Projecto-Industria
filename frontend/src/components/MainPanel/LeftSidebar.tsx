@@ -11,6 +11,7 @@ import {
   ChevronRight,
   ChevronsLeft,
 } from 'lucide-react';
+import { ROICoordinatesPanel } from './ROICoordinatesPanel';
 
 interface NavItem {
   label: string;
@@ -30,9 +31,18 @@ const NAV_ITEMS: NavItem[] = [
 interface LeftSidebarProps {
   collapsed?: boolean;
   onCollapse?: () => void;
+  cameraId: string;
+  naturalWidth?: number;
+  naturalHeight?: number;
 }
 
-export function LeftSideBar({ collapsed = false, onCollapse }: LeftSidebarProps) {
+export function LeftSideBar({
+  collapsed = false,
+  onCollapse,
+  cameraId,
+  naturalWidth,
+  naturalHeight,
+}: LeftSidebarProps) {
   const [openSections, setOpenSections] = useState<string[]>(['Imagen']);
   const [activeItem, setActiveItem] = useState<string | null>(null);
 
@@ -43,7 +53,7 @@ export function LeftSideBar({ collapsed = false, onCollapse }: LeftSidebarProps)
   };
 
   return (
-    <aside className="flex flex-col bg-white rounded-2xl border-[#e2e5ea] h-fit w-52 shrink-0 mb-72">
+    <aside className="flex flex-col bg-white rounded-2xl border-[#e2e5ea] w-52 shrink-0 overflow-y-auto max-h-full">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3.5 border-b border-[#e2e5ea]">
         {!collapsed && (
@@ -102,6 +112,16 @@ export function LeftSideBar({ collapsed = false, onCollapse }: LeftSidebarProps)
                       </button>
                     );
                   })}
+
+                  {label === 'Imagen' && activeItem === 'ROI' && (
+                    <div className="px-3 pb-2">
+                      <ROICoordinatesPanel
+                        cameraId={cameraId}
+                        naturalWidth={naturalWidth}
+                        naturalHeight={naturalHeight}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
