@@ -147,9 +147,17 @@ Projecto-Industria/
 │   ├── core/
 │   │   └── config.py            # Configuración centralizada
 │   └── api/
-│       └── routers/
-│           ├── health.py        # Endpoint /signal
-│           └── inference.py     # Endpoints de inferencia (en desarrollo)
+│   │    └── routers/
+│   │        ├── health.py        # Endpoint /signal
+│   │        └── inference.py     # Endpoints de inferencia (en desarrollo)
+│   │        └── camera.py        # Endpoints de cámaras
+│   │        └── stream.py        # Endpoints de stream
+│   └── services/
+│        └── camera_registry.py (gestión de sesiones de cámaras)
+│─── tests/
+│         ├── test_camera_registry.py (pruebas para camera_registry.py)
+│         └── manual/
+│                └──  test_reject_second_client.py (prueba de que no pueden conectarse 2 clientes a una misma cámara)
 ├── .env.example                 # Plantilla de variables de entorno
 ├── .gitignore
 └── README.md
