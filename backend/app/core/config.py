@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     ws_max_queue_size: int = 5
     max_cameras: int = 4
 
+    # Reconexión de sesiones de cámara (camera_registry.py)
+    max_retries: int = 5
+    retry_backoff_base: float = 0.5
+    retry_backoff_max: float = 8.0
+    read_timeout_seconds: float = 2.0
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

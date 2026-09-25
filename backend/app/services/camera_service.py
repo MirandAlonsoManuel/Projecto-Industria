@@ -118,6 +118,14 @@ def detect_available_cameras(max_index: int = 4) -> list[dict]:
 
     Nota: en Windows con DirectShow, probar índices inexistentes tarda ~500 ms
     cada uno, por eso el rango se limita a 4.
+
+    NOTA (v2 del diseño de sesiones): el endpoint `/cameras` ya NO usa esta
+    función directamente — abrir ciegamente cada índice colisionaría con
+    una cámara que ya tiene sesión activa en `camera_registry`. El router
+    ahora sondea por `camera_id` individual vía `CameraRegistry.probe()`,
+    saltando los índices que ya están en el registro. Esta función se deja
+    intacta por si algún otro consumidor (pruebas, script de diagnóstico)
+    la sigue necesitando tal cual.
     """
     result = []
     for i in range(max_index):

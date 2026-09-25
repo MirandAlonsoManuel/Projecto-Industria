@@ -5,12 +5,31 @@ Inicializa la instancia de FastAPI con la configuración del proyecto
 y registra todos los routers disponibles.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
+from app.services.camera_registry import get_camera_registry
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Ciclo de vida de la aplicación.
+
+    [SUPUESTO] Este lifespan solo cubre el cierre ordenado del registro de
+    cámaras (requisito propio de esta línea de trabajo: ninguna sesión ni
+    dispositivo debe quedar abierto al apagar la app). Si el líder técnico
+    ya definió, en otra rama, un lifespan propio para base de datos y/o
+    modelo de inferencia, ambos deben fusionarse aquí — FastAPI solo
+    admite un lifespan por aplicación.
+    """
+    yield
+    await get_camera_registry().shutdown_all()
 
 
 def create_app() -> FastAPI:
@@ -29,6 +48,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.version_api,
+        lifespan=lifespan,
     )
 
     app.add_middleware(
