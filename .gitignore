@@ -54,3 +54,10 @@ Thumbs.db
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
+
+.venv/
+.venv311/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

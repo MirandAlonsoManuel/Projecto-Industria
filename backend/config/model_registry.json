@@ -1,0 +1,105 @@
+{
+  "models": [
+    {
+      "id": "yolo26n-localization",
+      "task": "localization",
+      "backend": "ultralytics",
+      "default": true,
+      "enabled": true,
+      "config": {
+        "weights": "yolo26n.pt"
+      }
+    },
+    {
+      "id": "yolo26s-localization",
+      "task": "localization",
+      "backend": "ultralytics",
+      "default": false,
+      "enabled": true,
+      "config": {
+        "weights": "yolo26s.pt"
+      }
+    },
+    {
+      "id": "yolo11n-localization",
+      "task": "localization",
+      "backend": "ultralytics",
+      "default": false,
+      "enabled": true,
+      "config": {
+        "weights": "yolo11n.pt"
+      }
+    },
+    {
+      "id": "efficientnet-b0-classification",
+      "task": "classification",
+      "backend": "torchvision",
+      "default": true,
+      "enabled": true,
+      "config": {
+        "architecture": "efficientnet_b0"
+      }
+    },
+    {
+      "id": "resnet50-classification",
+      "task": "classification",
+      "backend": "torchvision",
+      "default": false,
+      "enabled": true,
+      "config": {
+        "architecture": "resnet50"
+      }
+    },
+    {
+      "id": "vit-b16-classification",
+      "task": "classification",
+      "backend": "torchvision",
+      "default": false,
+      "enabled": true,
+      "config": {
+        "architecture": "vit_b_16"
+      }
+    },
+    {
+      "id": "paddleocr-es",
+      "task": "ocr",
+      "backend": "paddleocr",
+      "default": true,
+      "enabled": true,
+      "config": {
+        "lang": "es"
+      }
+    },
+    {
+      "id": "reference-diff-v1",
+      "task": "anomaly",
+      "backend": "reference_diff",
+      "default": true,
+      "enabled": true,
+      "config": {
+        "threshold": 25,
+        "min_area": 64
+      }
+    },
+    {
+      "id": "patchcore-candidate",
+      "task": "anomaly",
+      "backend": "anomalib",
+      "default": false,
+      "enabled": false,
+      "config": {
+        "algorithm": "patchcore"
+      }
+    },
+    {
+      "id": "efficientad-candidate",
+      "task": "anomaly",
+      "backend": "anomalib",
+      "default": false,
+      "enabled": false,
+      "config": {
+        "algorithm": "efficientad"
+      }
+    }
+  ]
+}

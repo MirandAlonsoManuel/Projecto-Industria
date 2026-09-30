@@ -1,0 +1,82 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: #f5f6f8;
+  color: #1f2430;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+
+.topBar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 56px;
+  flex-shrink: 0;
+  padding: 0 20px;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e5ea;
+}
+
+.statusPill {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+}
+
+.statusPillConnected {
+  background: rgba(30, 158, 99, 0.12);
+  color: #1e9e63;
+}
+
+.statusPillDisconnected {
+  background: rgba(214, 69, 69, 0.12);
+  color: #d64545;
+}
+
+.title {
+  flex: 1;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.cameraSelect {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid #e2e5ea;
+  background: #ffffff;
+  font-size: 13px;
+  color: #1f2430;
+  cursor: pointer;
+}
+
+.cameraSelect:focus {
+  outline: 2px solid #2f6fe4;
+  outline-offset: 1px;
+}
+
+.body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 260px 1fr 280px;
+  gap: 16px;
+  padding: 16px;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .body {
+    grid-template-columns: 1fr;
+  }
+}

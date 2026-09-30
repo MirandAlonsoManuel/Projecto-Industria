@@ -1,0 +1,57 @@
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  min-height: 0;
+}
+
+.viewer {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  background: #1f2430;
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.placeholderFeed {
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.noSignal {
+  color: #d64545;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.streamImage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.roiBox {
+  position: absolute;
+  border: 2px solid #2f6fe4;
+  background: rgba(47, 111, 228, 0.12);
+  border-radius: 4px;
+}
+
+.roiBoxLabel {
+  position: absolute;
+  top: -20px;
+  left: 0;
+  font-size: 11px;
+  color: #2f6fe4;
+  background: #ffffff;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}

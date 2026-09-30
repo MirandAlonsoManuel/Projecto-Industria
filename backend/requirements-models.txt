@@ -1,0 +1,6 @@
+Pillow>=10.0.0
+torch
+torchvision
+ultralytics
+paddleocr>=3.0.0
+paddlepaddle>=3.0.0
