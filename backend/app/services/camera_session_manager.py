@@ -1,30 +1,21 @@
-"""
-Gestor centralizado de sesión de cámara.
-
-Garantías:
-  - Un único recurso de captura abierto (MAX_CONCURRENT_CAMERAS = 1).
-  - Un único cliente WebSocket activo (MAX_CONCURRENT_CLIENTS = 1).
-  - Estado, último frame, métricas y errores encapsulados y consultables.
-
-Para escalar a múltiples cámaras/clientes en el futuro:
-  1. Incrementar MAX_CONCURRENT_CAMERAS y MAX_CONCURRENT_CLIENTS en limits.py.
-  2. Cambiar `_session: CameraSession | None` por `_sessions: dict[str, CameraSession]`.
-  3. Actualizar acquire/release para indexar por camera_id.
-"""
 
 from __future__ import annotations
 
 import asyncio
+import functools
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
 from app.core.limits import FPS_WINDOW_FRAMES, MAX_ERROR_HISTORY
 from app.services.camera_service import CameraCapture, open_camera
+
+logger = logging.getLogger(__name__)
 
 
 # ── Estado ────────────────────────────────────────────────────────────────────
@@ -61,7 +52,7 @@ class SessionMetrics:
         return time.monotonic() - self.started_at
 
     def tick_frame(self) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         self._fps_times.append(now)
         self.frames_total += 1
         if len(self._fps_times) >= 2:
@@ -128,9 +119,36 @@ class CameraSession:
 class SessionBusyError(RuntimeError):
     """La sesión ya tiene un cliente activo."""
 
+    code = "CAMERA_BUSY"
+
 
 class SessionCameraError(RuntimeError):
     """No se pudo abrir la fuente de cámara solicitada."""
+
+    code = "CAMERA_UNAVAILABLE"
+
+
+# ── Utilidades internas ───────────────────────────────────────────────────────
+
+def _release_quietly(capture: CameraCapture) -> None:
+    """Cierra la captura sin propagar errores del driver.
+
+    Un fallo al cerrar no debe dejar la sesión marcada como ocupada: se registra
+    en el log y el gestor continúa como si el recurso hubiera quedado libre.
+    """
+    try:
+        capture.release()
+    except Exception:
+        logger.exception("Error del driver al liberar la cámara; se da por liberada")
+
+
+def _cleanup_orphan(future: asyncio.Future, cleanup: Callable[[Any], None]) -> None:
+    """Aplica `cleanup` al resultado de una operación cuyo solicitante se canceló."""
+    if future.cancelled() or future.exception() is not None:
+        return
+    result = future.result()
+    if result is not None:
+        cleanup(result)
 
 
 # ── Gestor ────────────────────────────────────────────────────────────────────
@@ -151,23 +169,52 @@ class CameraSessionManager:
     def session(self) -> Optional[CameraSession]:
         return self._session
 
+    @property
+    def is_busy(self) -> bool:
+        return self._session is not None
+
+    async def _run_blocking(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        on_orphan: Optional[Callable[[Any], None]] = None,
+    ) -> Any:
+    
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, fn, *args)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if on_orphan is not None:
+                future.add_done_callback(
+                    functools.partial(_cleanup_orphan, cleanup=on_orphan)
+                )
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                pass
+            raise
+
     async def acquire(self, camera_id: str, client_id: str) -> CameraSession:
         """
         Reserva la sesión para el cliente dado.
-
-        Raises:
-            SessionBusyError: ya hay un cliente activo.
-            SessionCameraError: la fuente de cámara no pudo abrirse.
         """
         async with self._lock:
-            if self._session is not None and self._session.active_client is not None:
+            if self._session is not None:
                 raise SessionBusyError(
                     f"Sesión ocupada por el cliente '{self._session.active_client}'. "
                     "Solo se permite un cliente activo a la vez."
                 )
 
-            loop = asyncio.get_running_loop()
-            capture = await loop.run_in_executor(None, open_camera, camera_id)
+            try:
+                capture = await self._run_blocking(
+                    open_camera, camera_id, on_orphan=_release_quietly
+                )
+            except Exception as exc:
+                raise SessionCameraError(
+                    f"Error del driver al abrir la cámara '{camera_id}': {exc}"
+                ) from exc
+
             if capture is None:
                 raise SessionCameraError(
                     f"No se pudo abrir la cámara '{camera_id}'. "
@@ -180,18 +227,55 @@ class CameraSessionManager:
                 active_client=client_id,
                 metrics=SessionMetrics(started_at=time.monotonic()),
             )
+            logger.info("Cámara '%s' asignada al cliente %s", camera_id, client_id)
             return self._session
 
-    async def release(self, client_id: str) -> None:
-        """Libera la sesión y el recurso de captura si el cliente es el titular."""
+    async def release(self, client_id: str) -> bool:
+    
         async with self._lock:
-            if self._session is None:
-                return
-            if self._session.active_client != client_id:
-                return
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._session.capture.release)
+            session = self._session
+            if session is None or session.active_client != client_id:
+                return False
+            # La sesión se marca libre antes de cerrar: aunque el driver falle,
+            # el recurso no queda secuestrado. El candado sigue tomado hasta que
+            # el cierre termina, así nadie abre mientras aún se está cerrando.
             self._session = None
+            await self._run_blocking(_release_quietly, session.capture)
+            logger.info("Cámara '%s' liberada por %s", session.camera_id, client_id)
+            return True
+
+    async def shutdown(self) -> None:
+        """Libera cualquier sesión activa. Pensado para el apagado de FastAPI."""
+        async with self._lock:
+            session = self._session
+            self._session = None
+            if session is not None:
+                await self._run_blocking(_release_quietly, session.capture)
+
+    async def scan_cameras(
+        self, detector: Callable[..., list[dict]]
+    ) -> list[dict]:
+        """
+        Escanea cámaras sin abrir nunca la que está en uso.
+        """
+        async with self._lock:
+            active_id = self._session.camera_id if self._session else None
+            exclude = {active_id} if active_id else set()
+            cameras = await self._run_blocking(
+                functools.partial(detector, exclude=exclude)
+            )
+
+        if active_id is not None and active_id.isdigit():
+            cameras.append(
+                {
+                    "id": active_id,
+                    "type": "usb",
+                    "source_url": active_id,
+                    "status": "in_use",
+                }
+            )
+            cameras.sort(key=lambda cam: int(cam["id"]))
+        return cameras
 
     def get_status(self) -> dict:
         """Estado serializable de la sesión actual."""
@@ -201,10 +285,7 @@ class CameraSessionManager:
 
     async def _reset(self) -> None:
         """Reinicia el estado liberando recursos. Solo para pruebas."""
-        async with self._lock:
-            if self._session is not None:
-                self._session.capture.release()
-            self._session = None
+        await self.shutdown()
 
 
 # Instancia global consumida por los routers
