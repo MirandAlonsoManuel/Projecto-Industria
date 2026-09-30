@@ -1,9 +1,3 @@
-"""
-Abstracción de hardware de cámara y utilidades del pipeline de captura.
-
-Implementa el patrón Strategy (CameraCapture) para desacoplar la lógica
-de streaming de la fuente de video concreta (USB, RTSP, archivo).
-"""
 
 from __future__ import annotations
 
@@ -11,7 +5,7 @@ import json
 import struct
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
@@ -99,8 +93,8 @@ def open_camera(source: str) -> Optional[CameraCapture]:
     """
     Instancia el adaptador correcto según el tipo de fuente e intenta abrirla.
 
-    Returns:
-        CameraCapture abierta, o None si la fuente no está disponible.
+    Si la fuente no llega a abrirse, el objeto de OpenCV se libera aquí mismo:
+    así ningún intento fallido deja un manejador del dispositivo colgado.
     """
     if source.isdigit():
         cam: CameraCapture = OpenCVCapture(int(source))
@@ -109,18 +103,22 @@ def open_camera(source: str) -> Optional[CameraCapture]:
     else:
         cam = FileCapture(source)
 
-    return cam if cam.is_opened else None
+    if cam.is_opened:
+        return cam
+
+    cam.release()
+    return None
 
 
-def detect_available_cameras(max_index: int = 4) -> list[dict]:
-    """
-    Prueba los primeros `max_index` índices USB y retorna los que abren.
-
-    Nota: en Windows con DirectShow, probar índices inexistentes tarda ~500 ms
-    cada uno, por eso el rango se limita a 4.
-    """
+def detect_available_cameras(
+    max_index: int = 4,
+    exclude: Optional[Iterable[str]] = None,
+) -> list[dict]:
+    skip = set(exclude or ())
     result = []
     for i in range(max_index):
+        if str(i) in skip:
+            continue
         cap = cv2.VideoCapture(i, _BACKEND)
         if cap.isOpened():
             result.append(
@@ -142,12 +140,7 @@ def encode_ws_message(
     camera_id: str,
     jpeg_quality: int = 70,
 ) -> bytes:
-    """
-    Serializa frame + metadatos al protocolo binario del WebSocket.
 
-    Formato:
-      [4 bytes uint32 BE — longitud del JSON] [JSON UTF-8] [JPEG bytes]
-    """
     metadata = {
         "connected": True,
         "camera_id": camera_id,
