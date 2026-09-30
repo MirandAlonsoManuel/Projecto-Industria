@@ -124,6 +124,15 @@ Documentación interactiva: `http://127.0.0.1:8000/docs`
 
 ---
 
+## Pruebas
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+---
+
 ## Variables de entorno
 
 Crea un archivo `.env` en la raíz del proyecto basándote en `.env.example`:
