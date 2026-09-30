@@ -61,3 +61,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
+
+.venv/
+.pytest_cache/
+__pycache__/
