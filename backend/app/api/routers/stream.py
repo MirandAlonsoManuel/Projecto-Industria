@@ -1,15 +1,11 @@
 """
 Router WebSocket para streaming en tiempo real de frames de cámara.
-
-Protocolo binario por mensaje:
-  [4 bytes uint32 big-endian = longitud JSON] [JSON metadata UTF-8] [JPEG bytes]
-
-El primer mensaje siempre es JSON de texto con el estado de conexión.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 
@@ -39,11 +35,6 @@ async def stream_camera(
 ) -> None:
     """
     Transmite frames de la cámara procesados en tiempo real.
-
-    Códigos de cierre WebSocket:
-    - 1000 — cierre normal (sin cámara o desconexión limpia del cliente).
-    - 1008 — sesión ocupada: ya hay un cliente activo.
-    - 1011 — error interno del servidor.
     """
     await websocket.accept()
 
@@ -54,28 +45,40 @@ async def stream_camera(
         session = await camera_session_manager.acquire(camera_id, client_id)
     except SessionBusyError as exc:
         await websocket.send_json(
-            {"connected": False, "camera_id": camera_id, "description": str(exc)}
+            {
+                "connected": False,
+                "camera_id": camera_id,
+                "error": exc.code,
+                "description": "La cámara ya está en uso por otro cliente. "
+                "Intente de nuevo cuando se libere.",
+            }
         )
         await websocket.close(code=1008)
         return
     except SessionCameraError as exc:
         await websocket.send_json(
-            {"connected": False, "camera_id": camera_id, "description": str(exc)}
+            {
+                "connected": False,
+                "camera_id": camera_id,
+                "error": exc.code,
+                "description": str(exc),
+            }
         )
         await websocket.close(code=1000)
         return
 
-    await websocket.send_json(
-        {
-            "connected": True,
-            "camera_id": camera_id,
-            "description": "Cámara detectada. Iniciando transmisión de video.",
-        }
-    )
-
-    loop = asyncio.get_running_loop()
-
     try:
+        await websocket.send_json(
+            {
+                "connected": True,
+                "camera_id": camera_id,
+                "error": None,
+                "description": "Cámara detectada. Iniciando transmisión de video.",
+            }
+        )
+
+        loop = asyncio.get_running_loop()
+
         while True:
             t0 = time.monotonic()
 
@@ -88,6 +91,7 @@ async def stream_camera(
                     {
                         "connected": False,
                         "camera_id": camera_id,
+                        "error": "CAMERA_NO_FRAMES",
                         "description": "La cámara dejó de enviar frames.",
                     }
                 )
@@ -115,6 +119,9 @@ async def stream_camera(
         pass
     except Exception as exc:
         session.record_error(str(exc))
-        await websocket.close(code=1011)
+        # El socket puede estar ya cerrado
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1011)
     finally:
+        # Pase lo que pase, la cámara vuelve a quedar disponible.
         await camera_session_manager.release(client_id)

@@ -1,13 +1,5 @@
-"""
-Router REST para gestión y consulta de fuentes de video (cámaras).
-
-Todos los endpoints siguen la estructura de respuesta uniforme:
-  { "data": ..., "error": null | string, "meta": { ... } }
-"""
 
 from __future__ import annotations
-
-import asyncio
 
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
@@ -23,21 +15,19 @@ router = APIRouter(tags=["cameras"])
     summary="Listar cámaras disponibles en el dispositivo",
     description=(
         "Escanea los índices USB del dispositivo y retorna las cámaras "
-        "que responden correctamente. Si no se detecta ninguna, `connected` "
-        "será `false` y `data` estará vacío."
+        "que responden correctamente. La cámara que esté transmitiendo se "
+        "reporta con `status: in_use` sin volver a abrirla. Si no se detecta "
+        "ninguna, `connected` será `false` y `data` estará vacío."
     ),
 )
 async def list_cameras() -> JSONResponse:
     """
     Retorna las cámaras detectadas en el dispositivo.
 
-    **Códigos de respuesta:**
-    - `200 OK` — escaneo completado (puede retornar lista vacía si no hay cámaras).
+    El escaneo pasa por el gestor de sesión para que nunca abra la cámara
+    que ya está en uso (acceso exclusivo).
     """
-    loop = asyncio.get_event_loop()
-    cameras: list[dict] = await loop.run_in_executor(
-        None, detect_available_cameras
-    )
+    cameras = await camera_session_manager.scan_cameras(detect_available_cameras)
 
     connected = len(cameras) > 0
     description = (
