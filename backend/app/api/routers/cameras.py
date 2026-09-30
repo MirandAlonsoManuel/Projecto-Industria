@@ -13,6 +13,7 @@ from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
 from app.services.camera_service import detect_available_cameras
+from app.services.camera_session_manager import camera_session_manager
 
 router = APIRouter(tags=["cameras"])
 
@@ -56,4 +57,20 @@ async def list_cameras() -> JSONResponse:
                 "description": description,
             },
         },
+    )
+
+
+@router.get(
+    "/cameras/session",
+    summary="Estado de la sesión de cámara activa",
+    description=(
+        "Retorna el estado actual del gestor de sesiones: cámara activa, "
+        "cliente conectado, métricas de captura y registro de errores. "
+        "Si no hay sesión activa, `status` es `idle`."
+    ),
+)
+def session_status() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=camera_session_manager.get_status(),
     )

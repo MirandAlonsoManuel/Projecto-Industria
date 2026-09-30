@@ -5,44 +5,28 @@ Protocolo binario por mensaje:
   [4 bytes uint32 big-endian = longitud JSON] [JSON metadata UTF-8] [JPEG bytes]
 
 El primer mensaje siempre es JSON de texto con el estado de conexión.
-Si no hay cámara disponible se envía {"connected": false, ...} y se cierra
-la conexión con código 1000 (cierre normal).
-Test del websocket con ws://127.0.0.1:8000/ws/stream?camera_id=0
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
-from typing import Optional
+import uuid
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.config import get_settings
-from app.services.camera_service import (
-    CameraCapture,
-    encode_ws_message,
-    open_camera,
+from app.core.limits import TARGET_FPS
+from app.services.camera_service import encode_ws_message
+from app.services.camera_session_manager import (
+    SessionBusyError,
+    SessionCameraError,
+    camera_session_manager,
 )
 
 router = APIRouter(tags=["stream"])
 
-_TARGET_FPS = 30
-_FRAME_INTERVAL = 1.0 / _TARGET_FPS
-
-
-class _FPSTracker:
-    """Calcula FPS promedio sobre una ventana deslizante de frames."""
-
-    def __init__(self, window: int = 30) -> None:
-        self._times: deque[float] = deque(maxlen=window)
-
-    def tick(self) -> float:
-        self._times.append(time.monotonic())
-        if len(self._times) < 2:
-            return 0.0
-        return (len(self._times) - 1) / (self._times[-1] - self._times[0])
+_FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 
 @router.websocket("/ws/stream")
@@ -56,80 +40,66 @@ async def stream_camera(
     """
     Transmite frames de la cámara procesados en tiempo real.
 
-    **Flujo de mensajes:**
-    1. El servidor envía un mensaje **JSON texto** con el estado de conexión.
-    2. Si `connected` es `true`, los mensajes siguientes son **binarios**
-       (header 4B + JSON + JPEG).
-    3. Si la cámara se pierde durante el stream, se envía un JSON de error
-       y la conexión se cierra.
-
-    **Códigos de cierre WebSocket:**
-    - `1000` — cierre normal (sin cámara o desconexión limpia del cliente).
-    - `1011` — error interno del servidor.
+    Códigos de cierre WebSocket:
+    - 1000 — cierre normal (sin cámara o desconexión limpia del cliente).
+    - 1008 — sesión ocupada: ya hay un cliente activo.
+    - 1011 — error interno del servidor.
     """
-    await websocket.accept()  # HTTP 101 Switching Protocols
+    await websocket.accept()
 
     settings = get_settings()
-    loop = asyncio.get_event_loop()
-
-    camera: Optional[CameraCapture] = await loop.run_in_executor(
-        None, open_camera, camera_id
-    )
+    client_id = str(uuid.uuid4())
 
     try:
-        if camera is None:
-            await websocket.send_json(
-                {
-                    "connected": False,
-                    "camera_id": camera_id,
-                    "description": (
-                        f"No se detectó ninguna cámara en el dispositivo "
-                        f"(fuente: '{camera_id}'). "
-                        "Verifique que la cámara esté conectada y no esté "
-                        "siendo usada por otra aplicación."
-                    ),
-                }
-            )
-            await websocket.close(code=1000)
-            return
-
+        session = await camera_session_manager.acquire(camera_id, client_id)
+    except SessionBusyError as exc:
         await websocket.send_json(
-            {
-                "connected": True,
-                "camera_id": camera_id,
-                "description": "Cámara detectada. Iniciando transmisión de video.",
-            }
+            {"connected": False, "camera_id": camera_id, "description": str(exc)}
         )
+        await websocket.close(code=1008)
+        return
+    except SessionCameraError as exc:
+        await websocket.send_json(
+            {"connected": False, "camera_id": camera_id, "description": str(exc)}
+        )
+        await websocket.close(code=1000)
+        return
 
-        fps_tracker = _FPSTracker()
+    await websocket.send_json(
+        {
+            "connected": True,
+            "camera_id": camera_id,
+            "description": "Cámara detectada. Iniciando transmisión de video.",
+        }
+    )
 
+    loop = asyncio.get_running_loop()
+
+    try:
         while True:
             t0 = time.monotonic()
 
-            frame = await loop.run_in_executor(None, camera.read_frame)
+            frame = await loop.run_in_executor(None, session.capture.read_frame)
+            session.update_frame(frame)
 
             if frame is None:
+                session.record_error("La cámara dejó de enviar frames.")
                 await websocket.send_json(
                     {
                         "connected": False,
                         "camera_id": camera_id,
-                        "description": (
-                            "La cámara dejó de enviar frames. "
-                            "Es posible que haya sido desconectada."
-                        ),
+                        "description": "La cámara dejó de enviar frames.",
                     }
                 )
                 await websocket.close(code=1000)
                 break
 
-            fps = fps_tracker.tick()
-
             message = await loop.run_in_executor(
                 None,
                 lambda: encode_ws_message(
                     frame,
-                    [],  # detecciones — el pipeline ML las inyecta en producción
-                    fps,
+                    [],
+                    session.metrics.fps_current,
                     camera_id,
                     settings.jpeg_quality,
                 ),
@@ -143,8 +113,8 @@ async def stream_camera(
 
     except WebSocketDisconnect:
         pass
-    except Exception:
+    except Exception as exc:
+        session.record_error(str(exc))
         await websocket.close(code=1011)
     finally:
-        if camera is not None:
-            await loop.run_in_executor(None, camera.release)
+        await camera_session_manager.release(client_id)
