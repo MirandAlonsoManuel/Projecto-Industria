@@ -1,9 +1,6 @@
 
 from __future__ import annotations
 
-import json
-import struct
-import time
 from abc import ABC, abstractmethod
 from typing import Iterable, Optional
 
@@ -131,26 +128,3 @@ def detect_available_cameras(
             )
         cap.release()
     return result
-
-
-def encode_ws_message(
-    frame: np.ndarray,
-    detections: list,
-    fps: float,
-    camera_id: str,
-    jpeg_quality: int = 70,
-) -> bytes:
-
-    metadata = {
-        "connected": True,
-        "camera_id": camera_id,
-        "fps": round(fps, 2),
-        "timestamp": time.time(),
-        "detections": detections,
-    }
-    json_bytes = json.dumps(metadata).encode("utf-8")
-    header = struct.pack(">I", len(json_bytes))
-    _, jpeg_buf = cv2.imencode(
-        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
-    )
-    return header + json_bytes + jpeg_buf.tobytes()

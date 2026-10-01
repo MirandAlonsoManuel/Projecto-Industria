@@ -15,7 +15,6 @@ from app.schemas.inference import (
     ModelInfo,
     OCRResponse,
 )
-from app.services.camera_service import encode_ws_message
 from app.services.camera_session_manager import (
     SessionBusyError,
     SessionCameraError,
@@ -24,6 +23,7 @@ from app.services.camera_session_manager import (
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
 from app.services.inference_service import InferenceError, inference_service
 from app.services.model_registry import ModelRegistryError
+from app.services.stream_protocol import encode_ws_message
 
 router = APIRouter(tags=["inference"])
 

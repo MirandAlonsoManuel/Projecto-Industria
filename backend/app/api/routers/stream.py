@@ -13,12 +13,12 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.config import get_settings
 from app.core.limits import TARGET_FPS
-from app.services.camera_service import encode_ws_message
 from app.services.camera_session_manager import (
     SessionBusyError,
     SessionCameraError,
     camera_session_manager,
 )
+from app.services.stream_protocol import encode_ws_message
 
 router = APIRouter(tags=["stream"])
 
