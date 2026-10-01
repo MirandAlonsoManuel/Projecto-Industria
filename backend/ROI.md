@@ -74,6 +74,8 @@ curl -X POST \
 ws://127.0.0.1:8000/ws/inference-stream?camera_id=0&model_id=yolo26n-localization&x1=100&y1=100&x2=400&y2=400
 ```
 
+El stream envía siempre el frame completo; el ROI solo delimita la zona donde se ejecuta la inferencia.
+
 ## Respuesta
 
 Las respuestas incluyen:
