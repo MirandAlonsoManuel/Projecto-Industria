@@ -37,6 +37,8 @@ Cuando termina cualquiera de las tareas del cliente (se desconecta, la cámara d
 2. `release()` cancela la tarea de captura y espera a que concluya la lectura en curso.
 3. Solo entonces se cierra la cámara y la sesión queda `idle`.
 
+Si `read_frame()` sigue bloqueado pasado el margen de espera (`FRAME_STALE_TIMEOUT_S`), la sesión queda `idle` pero el `release()` del driver **no** se ejecuta todavía: queda programado para el momento en que esa lectura termine. La cámara nunca se cierra con una lectura en curso.
+
 ## Decisión: desacople por frame completo, no por ROI
 
 La captura publica siempre el frame entero. El ROI se aplica después, únicamente en la tarea de inferencia.
@@ -86,6 +88,7 @@ python -m pytest -v
 | Captura, serialización y comunicación separadas | `test_frame_slot.py`, `test_inferencia_lenta_no_frena_el_video` |
 | Cliente lento conserva frames recientes sin retraso acumulado | `test_cliente_lento_recibe_frames_recientes_sin_retraso_acumulado` |
 | La desconexión cancela ordenadamente las tareas | `test_desconexion_cancela_tareas_y_libera_la_camara`, `test_desconexion_detiene_la_captura_antes_de_liberar` |
+| La cámara no se cierra mientras `read_frame()` sigue bloqueado | `test_release_no_cierra_la_camara_mientras_read_frame_sigue_bloqueado`, `test_shutdown_no_cierra_la_camara_mientras_read_frame_sigue_bloqueado`, `test_desconexion_con_read_frame_bloqueado_libera_la_sesion_sin_cerrar_a_mitad` |
 
 Las pruebas de M03 (`test_camera_exclusive_access.py`) siguen pasando sin modificarse.
 
@@ -122,7 +125,7 @@ Para que el paso 4 se note, el video debe tener contenido pesado y el cliente de
 
 ## Limitaciones conocidas
 
-- **Liberación con una lectura colgada.** Al liberar se espera hasta `FRAME_STALE_TIMEOUT_S` (5 s) a que termine la lectura en curso. Con una fuente RTSP que no responde, el siguiente cliente puede esperar ese tiempo.
+- **Liberación con una lectura colgada.** Al liberar se espera hasta `FRAME_STALE_TIMEOUT_S` (5 s) a que termine la lectura en curso. Con una fuente RTSP que no responde, el siguiente cliente puede esperar ese tiempo. Si la lectura sigue colgada después, el cierre del driver queda diferido: la sesión ya está libre, pero el siguiente `acquire()` de esa misma cámara puede fallar con `CAMERA_UNAVAILABLE` hasta que la lectura termine y el dispositivo se cierre.
 - **Ritmo de captura en Windows.** El temporizador del sistema (~15 ms) hace que la captura simulada ronde 22–32 FPS con un objetivo de 30.
 - **Cambio de parámetros en vivo.** Cambiar `conf`, `iou` o el ROI sigue requiriendo reconectar. La tarea receptora deja el lugar para hacerlo por mensaje, pero no está implementado.
 - **`ws_max_queue_size`.** Queda sin uso: el slot es de tamaño 1 por diseño.

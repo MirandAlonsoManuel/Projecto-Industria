@@ -10,6 +10,7 @@ Ejecutar:
 import asyncio
 import json
 import struct
+import threading
 import time
 from unittest.mock import patch
 
@@ -233,4 +234,154 @@ def test_error_de_inferencia_cierra_con_1011():
     assert ws.close_code == 1011
     assert ws.json_messages[-1]["error"] == "STREAM_ERROR"
     assert ws.json_messages[-1]["description"] == "ROI está fuera de los límites de la imagen."
+    assert capture.release_calls == 1
+
+
+# ── Liberación con read_frame() bloqueado ─────────────────────────────────────
+
+class BlockingCapture:
+    """Cámara falsa cuya lectura se queda bloqueada hasta llamar a `unblock()`."""
+
+    def __init__(self, frames_before_block: int = 2) -> None:
+        self.frames_before_block = frames_before_block
+        self.reads = 0
+        self.reading = False
+        self.release_calls = 0
+        self.released_during_read = False
+        self.blocked = threading.Event()
+        self._unblock = threading.Event()
+
+    def read_frame(self):
+        self.reading = True
+        try:
+            if self.reads >= self.frames_before_block:
+                self.blocked.set()
+                self._unblock.wait()
+            else:
+                time.sleep(0.005)
+            self.reads += 1
+            return np.zeros((48, 64, 3), dtype=np.uint8)
+        finally:
+            self.reading = False
+
+    def release(self) -> None:
+        self.release_calls += 1
+        if self.reading:
+            self.released_during_read = True
+
+    def unblock(self) -> None:
+        self._unblock.set()
+
+
+async def _wait_until(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("La condición esperada no se cumplió a tiempo")
+        await asyncio.sleep(0.01)
+
+
+async def _acquire_and_block(manager, capture, client_id="cliente-1"):
+    """Abre la sesión y espera a que la lectura de la cámara quede bloqueada."""
+    with patch("app.services.camera_session_manager.open_camera", return_value=capture):
+        await manager.acquire("0", client_id)
+    await _wait_until(capture.blocked.is_set)
+
+
+def test_release_no_cierra_la_camara_mientras_read_frame_sigue_bloqueado():
+    async def scenario():
+        capture = BlockingCapture()
+        manager = CameraSessionManager()
+        try:
+            await _acquire_and_block(manager, capture)
+            released = await manager.release("cliente-1")
+            # Se da margen de sobra: el cierre no debe ocurrir por tiempo.
+            await asyncio.sleep(0.3)
+            durante_bloqueo = (released, capture.release_calls, capture.reading, manager.is_busy)
+
+            capture.unblock()
+            await _wait_until(lambda: capture.release_calls == 1)
+            await asyncio.sleep(0.05)
+        finally:
+            capture.unblock()
+        return capture, durante_bloqueo
+
+    with patch("app.services.camera_session_manager.FRAME_STALE_TIMEOUT_S", 0.1):
+        capture, durante_bloqueo = asyncio.run(scenario())
+
+    released, release_calls, reading, is_busy = durante_bloqueo
+    assert released is True
+    assert reading is True
+    assert release_calls == 0  # la lectura sigue en curso: la cámara no se cierra
+    assert is_busy is False  # la sesión no queda secuestrada por la lectura
+
+    # Al terminar la lectura, la cámara se cierra exactamente una vez.
+    assert capture.release_calls == 1
+    assert capture.released_during_read is False
+
+
+def test_shutdown_no_cierra_la_camara_mientras_read_frame_sigue_bloqueado():
+    async def scenario():
+        capture = BlockingCapture()
+        manager = CameraSessionManager()
+        try:
+            await _acquire_and_block(manager, capture)
+            await manager.shutdown()
+            release_calls_bloqueado = capture.release_calls
+
+            capture.unblock()
+            await _wait_until(lambda: capture.release_calls == 1)
+        finally:
+            capture.unblock()
+        return capture, release_calls_bloqueado
+
+    with patch("app.services.camera_session_manager.FRAME_STALE_TIMEOUT_S", 0.1):
+        capture, release_calls_bloqueado = asyncio.run(scenario())
+
+    assert release_calls_bloqueado == 0
+    assert capture.release_calls == 1
+    assert capture.released_during_read is False
+
+
+def test_desconexion_con_read_frame_bloqueado_libera_la_sesion_sin_cerrar_a_mitad():
+    async def scenario():
+        ws = FakeWebSocket()
+        capture = BlockingCapture()
+        manager = CameraSessionManager()
+        try:
+            with patch(
+                "app.services.camera_session_manager.open_camera", return_value=capture
+            ):
+                task = asyncio.create_task(serve_camera_stream(ws, manager, "0", "listo"))
+                await _wait_until(capture.blocked.is_set)
+                ws.disconnect()
+                await asyncio.wait_for(task, timeout=5)
+            estado = (manager.get_status()["status"], capture.release_calls)
+
+            capture.unblock()
+            await _wait_until(lambda: capture.release_calls == 1)
+        finally:
+            capture.unblock()
+        return capture, estado
+
+    with patch("app.services.camera_session_manager.FRAME_STALE_TIMEOUT_S", 0.1):
+        capture, estado = asyncio.run(scenario())
+
+    assert estado == (SessionStatus.IDLE.value, 0)
+    assert capture.release_calls == 1
+    assert capture.released_during_read is False
+
+
+def test_release_cierra_de_inmediato_si_la_lectura_termina_dentro_del_margen():
+    async def scenario():
+        capture = FakeCapture(read_delay=0.05)
+        manager = CameraSessionManager()
+        with patch("app.services.camera_session_manager.open_camera", return_value=capture):
+            await manager.acquire("0", "cliente-1")
+        await asyncio.sleep(0.12)
+        await manager.release("cliente-1")
+        return capture
+
+    capture = asyncio.run(scenario())
+
     assert capture.release_calls == 1

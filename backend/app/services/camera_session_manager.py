@@ -111,6 +111,8 @@ class CameraSession:
     )
     frames: FrameSlot = field(default_factory=FrameSlot, repr=False)
     capture_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    # Lectura de cámara en curso (o la última): mientras no termine, no se cierra.
+    pending_read: Optional[asyncio.Future] = field(default=None, repr=False)
 
     def update_frame(self, frame: Optional[np.ndarray]) -> None:
         """Actualiza el último frame y avanza las métricas."""
@@ -194,11 +196,13 @@ async def _capture_loop(session: CameraSession) -> None:
             t0 = time.monotonic()
 
             read = loop.run_in_executor(None, session.capture.read_frame)
+            session.pending_read = read
             try:
                 frame = await asyncio.shield(read)
             except asyncio.CancelledError:
-                # La lectura sigue en su hilo: se espera a que termine para
-                # que la cámara no se libere a mitad de un read.
+                # La lectura sigue en su hilo: se le da un margen para terminar.
+                # Si sigue bloqueada, el cierre de la cámara queda diferido
+                # (ver _close_capture); aquí nunca se libera a mitad de un read.
                 await asyncio.wait([read], timeout=FRAME_STALE_TIMEOUT_S)
                 raise
 
@@ -228,6 +232,16 @@ async def _stop_capture(session: CameraSession) -> None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     session.frames.close("Sesión de cámara liberada.")
+
+
+def _release_when_read_ends(read: asyncio.Future, capture: CameraCapture) -> None:
+    """Cierra la cámara en cuanto termine la lectura que seguía bloqueada."""
+    loop = read.get_loop()
+
+    def _release(_: asyncio.Future) -> None:
+        loop.run_in_executor(None, _release_quietly, capture)
+
+    read.add_done_callback(_release)
 
 
 # ── Gestor ────────────────────────────────────────────────────────────────────
@@ -273,6 +287,29 @@ class CameraSessionManager:
             except asyncio.CancelledError:
                 pass
             raise
+
+    async def _close_capture(self, session: CameraSession) -> None:
+        """
+        Detiene la captura y cierra la cámara, nunca a mitad de una lectura.
+
+        Si read_frame() sigue bloqueado tras detener la captura, release() del
+        driver no se ejecuta ahora: queda programado para cuando esa lectura
+        termine. La sesión se da por libre de inmediato para no retener al
+        siguiente cliente.
+        """
+        try:
+            await _stop_capture(session)
+        finally:
+            read = session.pending_read
+            if read is not None and not read.done():
+                logger.warning(
+                    "Lectura de la cámara '%s' aún bloqueada; el cierre se "
+                    "difiere hasta que termine",
+                    session.camera_id,
+                )
+                _release_when_read_ends(read, session.capture)
+            else:
+                await self._run_blocking(_release_quietly, session.capture)
 
     async def acquire(self, camera_id: str, client_id: str) -> CameraSession:
         """
@@ -324,10 +361,7 @@ class CameraSessionManager:
             self._session = None
             # Primero se detiene la captura; la cámara se cierra después, aun
             # si esta liberación se cancela mientras espera a la tarea.
-            try:
-                await _stop_capture(session)
-            finally:
-                await self._run_blocking(_release_quietly, session.capture)
+            await self._close_capture(session)
             logger.info("Cámara '%s' liberada por %s", session.camera_id, client_id)
             return True
 
@@ -337,10 +371,7 @@ class CameraSessionManager:
             session = self._session
             self._session = None
             if session is not None:
-                try:
-                    await _stop_capture(session)
-                finally:
-                    await self._run_blocking(_release_quietly, session.capture)
+                await self._close_capture(session)
 
     async def scan_cameras(
         self, detector: Callable[..., list[dict]]
