@@ -85,6 +85,8 @@ El nuevo stream opcional es:
 ws://127.0.0.1:8000/ws/inference-stream?camera_id=0&model_id=yolo26n-localization&infer_every_n_frames=3
 ```
 
+La inferencia corre en una tarea separada de la captura y del envío: un modelo lento no baja los FPS del video, solo actualiza las detecciones con menos frecuencia. `infer_every_n_frames` se cuenta sobre frames capturados. Ver [docs/desacople-captura-websocket.md](docs/desacople-captura-websocket.md).
+
 ## Instalación
 
 Base:
