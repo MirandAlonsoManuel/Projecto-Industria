@@ -5,12 +5,48 @@ Inicializa la instancia de FastAPI con la configuración del proyecto
 y registra todos los routers disponibles.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
+from app.services.inference_engine import SimulatedInferenceEngine
+from app.services.inference_lifecycle import InferenceEngineLifecycle
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Ciclo de vida de la aplicación.
+
+    [SUPUESTO] El motor conectado aquí es `SimulatedInferenceEngine`
+    (E01/E02 no integran todavía un motor real — ver
+    docs/E02_inference_lifecycle_contract.md, sección 5). Conectar un
+    motor real es trabajo de una tarea posterior.
+
+    [SUPUESTO] Si `lifecycle.initialize()` falla, la excepción se deja
+    propagar: el arranque de la aplicación falla por completo (FastAPI
+    nunca llega a aceptar tráfico) en vez de iniciar en un modo
+    degradado. Es la opción más simple y seguridad por defecto; si el
+    equipo prefiere que la app arranque igual y solo el estado quede en
+    `ERROR` (modo degradado), es una decisión de producto a confirmar
+    con el líder técnico, no algo que este ticket decida unilateralmente.
+
+    Si el líder técnico ya definió, en otra rama, un lifespan propio
+    para base de datos y/o cámaras, ambos deben fusionarse aquí —
+    FastAPI solo admite un lifespan por aplicación.
+    """
+    lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
+    app.state.inference_lifecycle = lifecycle
+
+    await lifecycle.initialize()
+    try:
+        yield
+    finally:
+        await lifecycle.shutdown()
 
 
 def create_app() -> FastAPI:
@@ -29,6 +65,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.version_api,
+        lifespan=lifespan,
     )
 
     app.add_middleware(
