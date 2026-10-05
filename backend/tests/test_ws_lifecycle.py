@@ -158,7 +158,7 @@ def test_cliente_de_sesion_automatica_la_cierra_al_salir(client, gestor, stats):
 
     esperar(lambda: gestor.state.value == "idle")
     assert stats.active == 0
-    eventos = [e["event"] for e in gestor.get_status()["events"]]
+    eventos = [e["event"] for e in gestor.get_lifecycle_status()["events"]]
     assert eventos == ["started", "client_connected", "client_disconnected", "stopped"]
 
 
@@ -237,10 +237,14 @@ def test_camara_distinta_a_la_de_la_sesion_se_rechaza(client, gestor):
 def test_inference_stream_entrega_detecciones(client, fake_inference):
     with client.websocket_connect("/ws/inference-stream?camera_id=0&infer_every_n_frames=1") as ws:
         bienvenida = ws.receive_json()
-        frame = ws.receive_bytes()
+        # La inferencia corre aparte: los primeros frames pueden salir sin detecciones
+        for _ in range(60):
+            frame = ws.receive_bytes()
+            longitud = int.from_bytes(frame[:4], "big")
+            metadatos = json.loads(frame[4:4 + longitud])
+            if metadatos["detections"]:
+                break
 
-    longitud = int.from_bytes(frame[:4], "big")
-    metadatos = json.loads(frame[4:4 + longitud])
     assert bienvenida["state"] == "streaming"
     assert metadatos["detections"] == [{"label": "pieza", "confidence": 0.9}]
     assert fake_inference.calls >= 1
@@ -272,14 +276,14 @@ def test_inference_stream_responde_igual_ante_stop(client, gestor):
     assert codigo == 1000
 
 
-def test_falla_de_inferencia_cierra_con_processing_error(client, gestor, fake_inference, stats):
+def test_falla_de_inferencia_cierra_con_stream_error(client, gestor, fake_inference, stats):
     fake_inference.fail = True
 
     with client.websocket_connect("/ws/inference-stream?camera_id=0") as ws:
         ws.receive_json()
         fin, codigo = esperar_fin(ws)
 
-    assert fin["error"] == "PROCESSING_ERROR"
+    assert fin["error"] == "STREAM_ERROR"
     assert codigo == 1011
     esperar(lambda: stats.active == 0)
 
@@ -292,5 +296,5 @@ def test_eventos_tienen_seq_consecutivo(client, gestor):
         ws.receive_bytes()
 
     esperar(lambda: gestor.state.value == "idle")
-    secuencia = [e["seq"] for e in gestor.get_status()["events"]]
+    secuencia = [e["seq"] for e in gestor.get_lifecycle_status()["events"]]
     assert secuencia == list(range(1, len(secuencia) + 1))

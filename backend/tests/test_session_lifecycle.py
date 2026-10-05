@@ -114,8 +114,27 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def read_frame(manager: CameraSessionManager, client_id: str):
+    """Siguiente frame del slot del cliente (con la captura desacoplada)."""
+    packet = await asyncio.wait_for(manager.next_frame(client_id), timeout=2)
+    return packet.frame
+
+
+async def consumir_hasta_el_fin(manager: CameraSessionManager, client_id: str) -> None:
+    """Consume frames como lo haría el WebSocket hasta que la sesión del cliente termine.
+
+    El slot entrega el último frame pendiente antes de reportar el cierre,
+    igual que en el stream real; por eso se avanza por número de secuencia.
+    """
+    ultimo = 0
+    for _ in range(100):
+        packet = await asyncio.wait_for(manager.next_frame(client_id, ultimo), timeout=2)
+        ultimo = packet.seq
+    raise AssertionError("la sesión del cliente no terminó")
+
+
 def eventos(manager: CameraSessionManager) -> list[str]:
-    return [e["event"] for e in manager.get_status()["events"]]
+    return [e["event"] for e in manager.get_lifecycle_status()["events"]]
 
 
 # ── C1: operaciones disponibles y transiciones válidas ───────────────────────
@@ -173,21 +192,21 @@ def test_c1_sesion_de_operador_sigue_abierta_al_irse_el_cliente(manager, camera,
     assert stats.opens == 1
 
 
-def test_c1_read_frame_entrega_frames_al_cliente_activo(manager, camera):
+def test_c1_el_cliente_recibe_frames_de_la_captura(manager, camera):
     async def escenario():
         await manager.connect_client("0", "cliente-1")
-        return await manager.read_frame("cliente-1")
+        return await read_frame(manager, "cliente-1")
 
     frame = run(escenario())
 
     assert frame is not None
-    assert manager.session.metrics.frames_total == 1
+    assert manager.session.metrics.frames_total >= 1
 
 
 def test_c1_estado_expone_ciclo_de_vida_completo(manager, camera):
     run(manager.connect_client("0", "cliente-1"))
 
-    status = manager.get_status()
+    status = manager.get_lifecycle_status()
 
     assert status["state"] == "streaming"
     assert status["started_by"] == "client"
@@ -252,7 +271,7 @@ def test_c2_stop_con_cliente_le_avisa_session_stopped(manager, camera, stats):
     async def escenario():
         await manager.connect_client("0", "cliente-1")
         await manager.stop()
-        await manager.read_frame("cliente-1")
+        await consumir_hasta_el_fin(manager, "cliente-1")
 
     with pytest.raises(ClientSessionEndedError) as info:
         run(escenario())
@@ -267,7 +286,7 @@ def test_c2_desconexion_forzada_le_avisa_client_disconnected(manager, camera, st
         await manager.connect_client("0", "cliente-1")
         expulsado = await manager.force_disconnect()
         assert expulsado == "cliente-1"
-        await manager.read_frame("cliente-1")
+        await consumir_hasta_el_fin(manager, "cliente-1")
 
     with pytest.raises(ClientSessionEndedError) as info:
         run(escenario())
@@ -285,7 +304,7 @@ def test_c3_segundo_cliente_rechazado_sin_alterar_al_activo(manager, camera):
         await manager.connect_client("0", "cliente-1")
         with pytest.raises(SessionBusyError):
             await manager.connect_client("0", "cliente-2")
-        return await manager.read_frame("cliente-1")
+        return await read_frame(manager, "cliente-1")
 
     assert run(escenario()) is not None
     assert manager.session.active_client == "cliente-1"
@@ -323,14 +342,11 @@ def test_c3_stop_espera_la_lectura_en_curso(manager, camera, stats):
 
     async def escenario():
         await manager.connect_client("0", "cliente-1")
-        lectura = asyncio.create_task(manager.read_frame("cliente-1"))
-        await asyncio.sleep(0.02)  # la lectura ya está en el hilo
+        await asyncio.sleep(0.02)  # la captura ya está leyendo en su hilo
         await manager.stop()
-        return await lectura
 
-    frame = run(escenario())
+    run(escenario())
 
-    assert frame is not None
     assert stats.released_while_reading is False
     assert stats.active == 0
 
@@ -343,8 +359,8 @@ def test_c3_operaciones_mezcladas_dejan_estado_determinista(manager, camera, sta
         for _ in range(5):
             try:
                 await manager.connect_client("0", nombre)
-                await manager.read_frame(nombre)
-            except (SessionError, ClientSessionEndedError):
+                await read_frame(manager, nombre)
+            except (SessionError, ClientSessionEndedError, asyncio.TimeoutError):
                 pass
             await manager.disconnect_client(nombre)
 
@@ -382,7 +398,7 @@ def test_c4_shutdown_libera_y_es_idempotente(manager, camera, stats):
 
     assert (primero, segundo) == (True, False)
     assert stats.active == 0
-    status = manager.get_status()
+    status = manager.get_lifecycle_status()
     assert status["state"] == "idle"
     assert status["accepting_clients"] is False
     shutdowns = [e for e in status["events"] if e["event"] == "shutdown"]
@@ -393,7 +409,7 @@ def test_c4_shutdown_avisa_al_cliente_conectado(manager, camera):
     async def escenario():
         await manager.connect_client("0", "cliente-1")
         await manager.shutdown()
-        await manager.read_frame("cliente-1")
+        await consumir_hasta_el_fin(manager, "cliente-1")
 
     with pytest.raises(ClientSessionEndedError) as info:
         run(escenario())
@@ -448,7 +464,7 @@ def test_c1_estado_stopping_mientras_se_libera_la_camara(manager, monkeypatch, s
         await manager.start("0")
         cierre = asyncio.create_task(manager.stop())
         await asyncio.get_running_loop().run_in_executor(None, liberando.wait, 2)
-        estado_durante = manager.get_status()
+        estado_durante = manager.get_lifecycle_status()
         continuar.set()
         await cierre
         return estado_durante

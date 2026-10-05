@@ -256,7 +256,7 @@ def test_apagado_global_al_cerrar_la_aplicacion(gestor, stats):
 
     # Al salir del bloque, FastAPI ejecuta el lifespan de apagado
     assert stats.active == 0
-    estado = gestor.get_status()
+    estado = gestor.get_lifecycle_status()
     assert estado["state"] == "idle"
     assert estado["accepting_clients"] is False
     assert estado["events"][-1]["event"] == "shutdown"
@@ -271,7 +271,7 @@ def test_apagado_global_sin_sesion_y_repetido(gestor, stats):
     with TestClient(app):
         pass
 
-    shutdowns = [e for e in gestor.get_status()["events"] if e["event"] == "shutdown"]
+    shutdowns = [e for e in gestor.get_lifecycle_status()["events"] if e["event"] == "shutdown"]
     assert [e["reason"] for e in shutdowns] == ["already_idle", "already_idle"]
     assert stats.opens == 0
 
