@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
-import uuid
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket
 
+from app.api.ws_camera import run_camera_stream
 from app.core.config import get_settings
-from app.core.limits import TARGET_FPS
 from app.schemas.inference import (
     AnomalyResponse,
     ClassificationResponse,
@@ -16,11 +14,7 @@ from app.schemas.inference import (
     OCRResponse,
 )
 from app.services.camera_service import encode_ws_message
-from app.services.camera_session_manager import (
-    SessionBusyError,
-    SessionCameraError,
-    camera_session_manager,
-)
+from app.services.camera_session_manager import camera_session_manager
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
 from app.services.inference_service import InferenceError, inference_service
 from app.services.model_registry import ModelRegistryError
@@ -179,83 +173,38 @@ async def inference_stream(
     x2: int | None = Query(default=None),
     y2: int | None = Query(default=None),
 ) -> None:
-    await websocket.accept()
+    """
+    Transmite frames con detecciones del modelo de localización.
 
+    Comparte la sesión y el ciclo de vida con `/ws/stream`: solo puede haber un
+    cliente entre ambos endpoints, y los mensajes, errores y códigos de cierre
+    son los mismos. Si la inferencia falla, el cliente recibe PROCESSING_ERROR
+    y la conexión se cierra con 1011.
+    """
     settings = get_settings()
-    client_id = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
-
-    try:
-        session = await camera_session_manager.acquire(camera_id, client_id)
-    except SessionBusyError as exc:
-        await websocket.send_json(
-            {"connected": False, "camera_id": camera_id, "description": str(exc)}
-        )
-        await websocket.close(code=1008)
-        return
-    except SessionCameraError as exc:
-        await websocket.send_json(
-            {"connected": False, "camera_id": camera_id, "description": str(exc)}
-        )
-        await websocket.close(code=1000)
-        return
-
-    await websocket.send_json(
-        {"connected": True, "camera_id": camera_id, "description": "Cámara detectada. Iniciando inferencia."}
-    )
-
-    frame_count = 0
     last_detections: list[dict] = []
-    _frame_interval = 1.0 / TARGET_FPS
 
-    try:
-        while True:
-            t0 = time.monotonic()
-
-            frame = await loop.run_in_executor(None, session.capture.read_frame)
-            session.update_frame(frame)
-
-            if frame is None:
-                session.record_error("La cámara dejó de enviar frames.")
-                await websocket.send_json(
-                    {"connected": False, "camera_id": camera_id, "description": "La cámara dejó de enviar frames."}
-                )
-                await websocket.close(code=1000)
-                break
-
-            if frame_count % infer_every_n_frames == 0:
-                try:
-                    cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
-                    _, last_detections = await loop.run_in_executor(
-                        None,
-                        lambda: inference_service.localize(cropped, model_id, conf, iou, offset),
-                    )
-                except Exception as exc:
-                    session.record_error(str(exc))
-                    await websocket.send_json(
-                        {"connected": False, "camera_id": camera_id, "description": str(exc)}
-                    )
-                    await websocket.close(code=1011)
-                    break
-
-            message = await loop.run_in_executor(
+    async def on_frame(frame, session, frame_index: int) -> bytes:
+        nonlocal last_detections
+        if frame_index % infer_every_n_frames == 0:
+            cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
+            _, last_detections = await loop.run_in_executor(
                 None,
-                lambda: encode_ws_message(
-                    frame, last_detections, session.metrics.fps_current, camera_id, settings.jpeg_quality
-                ),
+                lambda: inference_service.localize(cropped, model_id, conf, iou, offset),
             )
-            await websocket.send_bytes(message)
-            frame_count += 1
+        detections = last_detections
+        return await loop.run_in_executor(
+            None,
+            lambda: encode_ws_message(
+                frame, detections, session.metrics.fps_current, camera_id, settings.jpeg_quality
+            ),
+        )
 
-            elapsed = time.monotonic() - t0
-            sleep_for = max(0.0, _frame_interval - elapsed)
-            if sleep_for:
-                await asyncio.sleep(sleep_for)
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        session.record_error(str(exc))
-        await websocket.close(code=1011)
-    finally:
-        await camera_session_manager.release(client_id)
+    await run_camera_stream(
+        websocket,
+        camera_session_manager,
+        camera_id,
+        on_frame,
+        welcome="Cámara detectada. Iniciando inferencia.",
+    )
