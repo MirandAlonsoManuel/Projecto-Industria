@@ -18,6 +18,7 @@ from app.services.camera_session_manager import camera_session_manager
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
 from app.services.inference_service import InferenceError, inference_service
 from app.services.model_registry import ModelRegistryError
+from app.services.stream_runner import serve_camera_stream
 
 router = APIRouter(tags=["inference"])
 

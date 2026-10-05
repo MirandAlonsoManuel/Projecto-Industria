@@ -61,8 +61,12 @@ from app.core.limits import (
     MAX_ERROR_HISTORY,
 )
 from app.services.camera_service import CameraCapture, open_camera
+from app.services.frame_slot import FrameSlot
 
 logger = logging.getLogger(__name__)
+
+NO_FRAMES_CODE = "CAMERA_NO_FRAMES"
+_NO_FRAMES_MESSAGE = "La cámara dejó de enviar frames."
 
 
 # ── Estado ────────────────────────────────────────────────────────────────────
@@ -155,6 +159,20 @@ class SessionMetrics:
 
 
 @dataclass
+class DeliveryMetrics:
+    """Entrega al cliente: frames enviados y frames que se saltó por ir lento."""
+
+    frames_sent: int = 0
+    frames_skipped: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "frames_sent": self.frames_sent,
+            "frames_skipped": self.frames_skipped,
+        }
+
+
+@dataclass
 class CameraSession:
     camera_id: str
     capture: CameraCapture
@@ -164,6 +182,7 @@ class CameraSession:
     last_frame: Optional[np.ndarray] = None
     last_frame_ts: float = 0.0
     metrics: SessionMetrics = field(default_factory=SessionMetrics)
+    delivery: DeliveryMetrics = field(default_factory=DeliveryMetrics)
     errors: deque = field(
         default_factory=lambda: deque(maxlen=MAX_ERROR_HISTORY),
         repr=False,
@@ -194,6 +213,7 @@ class CameraSession:
             "started_by": self.started_by.value,
             "last_frame_ts": self.last_frame_ts or None,
             "metrics": self.metrics.to_dict(),
+            "delivery": self.delivery.to_dict(),
             "errors": [
                 {"timestamp": e.timestamp, "message": e.message}
                 for e in self.errors
