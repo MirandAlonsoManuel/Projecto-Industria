@@ -1,11 +1,17 @@
 """
 Gestor centralizado de sesión de cámara.
 
-Garantías de acceso exclusivo (M03):
-  - Un único recurso de captura abierto (MAX_CONCURRENT_CAMERAS = 1).
-  - Un único cliente activo (MAX_CONCURRENT_CLIENTS = 1).
+Acceso exclusivo (M03):
+  - Un único recurso de captura abierto y un único cliente activo.
   - Un segundo cliente recibe SessionBusyError sin tocar la sesión activa.
   - El escaneo de cámaras nunca abre la fuente que está en uso.
+
+Captura desacoplada (desacople captura–WebSocket):
+  - Cada sesión tiene una tarea de captura (`_capture_loop`) que lee la cámara
+    a TARGET_FPS y publica el frame completo en un FrameSlot. No conoce al
+    cliente ni al WebSocket.
+  - La cámara nunca se cierra con una lectura en curso: si read_frame() sigue
+    bloqueado al liberar, el cierre del driver se difiere hasta que termine.
 
 Ciclo de vida de la sesión (M07):
 
@@ -15,28 +21,25 @@ Ciclo de vida de la sesión (M07):
       └──────────── stop() ──────────┘        (sesión iniciada por operador)
 
   - Un cliente que se conecta con la sesión en `idle` la inicia por sí mismo
-    (started_by = "client"). Al irse ese cliente, la cámara se cierra sola,
-    porque nadie pidió mantenerla abierta.
-  - Una sesión iniciada con start() (started_by = "operator") sigue abierta
-    en `running` cuando el cliente se va, lista para el siguiente.
-  - Mientras la cámara se cierra, el estado es `stopping`: el hardware puede
-    tardar varios cientos de milisegundos en liberarse y nadie puede abrirla
-    hasta que termine.
-  - Cualquier operación fuera de orden lanza un SessionError con un código
-    estable que los routers traducen a una respuesta controlada.
-  - shutdown() es idempotente: libera lo que haya, deja de aceptar sesiones
-    nuevas y registra el evento cada vez que se invoca.
+    (started_by = "client"). Al irse ese cliente, la cámara se cierra sola.
+  - Una sesión iniciada con start() (started_by = "operator") sigue abierta y
+    capturando en `running` cuando el cliente se va, lista para el siguiente.
+  - Cada cliente consume su propio FrameSlot. Cuando un operador detiene la
+    sesión, expulsa al cliente o el servicio se apaga, ese slot se cierra con
+    el código de la causa (SESSION_STOPPED, CLIENT_DISCONNECTED o
+    SERVICE_SHUTDOWN), y así el WebSocket sabe qué explicarle al cliente.
+  - Mientras la cámara se cierra, el estado es `stopping`.
+  - Cualquier operación fuera de orden lanza un SessionError con código estable.
+  - shutdown() es idempotente: libera lo que haya y deja de aceptar sesiones.
 
-Concurrencia: toda transición ocurre dentro de `_lock`. Las lecturas de frames
-usan además un candado propio de la sesión (`io_lock`), de modo que el cierre
-espera a que termine la lectura en curso antes de liberar el dispositivo.
+Concurrencia: toda transición ocurre dentro de `_lock`. Cada operación se
+ejecuta en una tarea propia del gestor (`_run_detached`): si quien la pidió se
+cancela, la operación termina igual. Esto es necesario porque anyio, que usan
+Starlette y FastAPI, repite la cancelación en cada `await` del código cancelado.
 
-Cada operación se ejecuta en una tarea propia del gestor (`_run_detached`).
-Si quien la pidió se cancela (un cliente que se desconecta, un servidor que se
-apaga), la operación termina igual y el candado se suelta solo cuando el
-hardware quedó en un estado consistente. Esto es necesario porque anyio, que
-usan Starlette y FastAPI, repite la cancelación en cada `await` del código
-cancelado: esperar dentro de la tarea cancelada no basta.
+Compatibilidad: get_status() conserva el contrato de M01 (en `idle` responde
+exactamente {"status": "idle", "active_client": None}); el estado completo del
+ciclo de vida se consulta con get_lifecycle_status().
 
 Límite conocido: el candado vive en memoria del proceso. El servicio debe
 ejecutarse con un solo worker de uvicorn para que la exclusión sea real.
@@ -57,16 +60,26 @@ import numpy as np
 
 from app.core.limits import (
     FPS_WINDOW_FRAMES,
+    FRAME_STALE_TIMEOUT_S,
     LIFECYCLE_EVENT_HISTORY,
     MAX_ERROR_HISTORY,
+    TARGET_FPS,
 )
 from app.services.camera_service import CameraCapture, open_camera
-from app.services.frame_slot import FrameSlot
+from app.services.frame_slot import FramePacket, FrameSlot, FrameSlotClosed
 
 logger = logging.getLogger(__name__)
 
 NO_FRAMES_CODE = "CAMERA_NO_FRAMES"
+READ_ERROR_CODE = "CAMERA_READ_ERROR"
 _NO_FRAMES_MESSAGE = "La cámara dejó de enviar frames."
+
+# Descripción para el cliente cuando su sesión termina por una acción externa
+CLIENT_END_DESCRIPTIONS: dict[str, str] = {
+    "SESSION_STOPPED": "La sesión de cámara fue detenida.",
+    "CLIENT_DISCONNECTED": "Un operador cerró esta conexión.",
+    "SERVICE_SHUTDOWN": "El servicio se está apagando.",
+}
 
 
 # ── Estado ────────────────────────────────────────────────────────────────────
@@ -187,9 +200,17 @@ class CameraSession:
         default_factory=lambda: deque(maxlen=MAX_ERROR_HISTORY),
         repr=False,
     )
-    # Serializa lecturas y cierre: nunca se libera la captura a mitad de una lectura
-    io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Slot del cliente actual; la captura publica siempre en el vigente
+    frames: FrameSlot = field(default_factory=FrameSlot, repr=False)
+    capture_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    # Lectura de cámara en curso (o la última): mientras no termine, no se cierra.
+    pending_read: Optional[asyncio.Future] = field(default=None, repr=False)
     closed: bool = False
+
+    @property
+    def capture_alive(self) -> bool:
+        """La tarea de captura sigue corriendo (no terminó por falta de frames o error)."""
+        return self.capture_task is not None and not self.capture_task.done()
 
     def update_frame(self, frame: Optional[np.ndarray]) -> None:
         """Actualiza el último frame y avanza las métricas."""
@@ -318,6 +339,70 @@ class _Request:
         self.abandoned = False
 
 
+# ── Captura ───────────────────────────────────────────────────────────────────
+
+async def _capture_loop(session: CameraSession) -> None:
+    """
+    Ciclo de adquisición: lee la cámara a su ritmo y publica en el slot vigente.
+
+    No conoce al cliente ni al WebSocket. Termina si la cámara deja de
+    entregar frames o si la tarea se cancela al liberar la sesión.
+    """
+    loop = asyncio.get_running_loop()
+    interval = 1.0 / TARGET_FPS
+    try:
+        while True:
+            t0 = time.monotonic()
+
+            read = loop.run_in_executor(None, session.capture.read_frame)
+            session.pending_read = read
+            try:
+                frame = await asyncio.shield(read)
+            except asyncio.CancelledError:
+                # La lectura sigue en su hilo: se le da un margen para terminar.
+                # Si sigue bloqueada, el cierre de la cámara queda diferido
+                # (ver _close_capture); aquí nunca se libera a mitad de un read.
+                await asyncio.wait([read], timeout=FRAME_STALE_TIMEOUT_S)
+                raise
+
+            session.update_frame(frame)
+            if frame is None:
+                session.record_error(_NO_FRAMES_MESSAGE)
+                session.frames.close(_NO_FRAMES_MESSAGE, code=NO_FRAMES_CODE)
+                return
+            session.frames.publish(frame, session.last_frame_ts)
+
+            sleep_for = interval - (time.monotonic() - t0)
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Error del driver al leer la cámara '%s'", session.camera_id)
+        session.record_error(str(exc))
+        session.frames.close(str(exc), code=READ_ERROR_CODE)
+
+
+async def _stop_capture(session: CameraSession) -> None:
+    """Cancela la tarea de captura y espera a que termine. No propaga errores."""
+    task = session.capture_task
+    session.capture_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    session.frames.close("Sesión de cámara liberada.")
+
+
+def _release_when_read_ends(read: asyncio.Future, capture: CameraCapture) -> None:
+    """Cierra la cámara en cuanto termine la lectura que seguía bloqueada."""
+    loop = read.get_loop()
+
+    def _release(_: asyncio.Future) -> None:
+        loop.run_in_executor(None, _release_quietly, capture)
+
+    read.add_done_callback(_release)
+
+
 # ── Gestor ────────────────────────────────────────────────────────────────────
 
 class CameraSessionManager:
@@ -328,23 +413,22 @@ class CameraSessionManager:
       start / stop                       — administración explícita de la sesión
       connect_client / disconnect_client — entrada y salida del único cliente
       force_disconnect                   — expulsión del cliente por un operador
-      read_frame                         — lectura segura para el cliente activo
+      next_frame                         — siguiente frame del slot de un cliente
       shutdown                           — apagado global idempotente
-      get_status                         — estado y eventos del ciclo de vida
+      get_status / get_lifecycle_status  — estado (contrato M01) y ciclo de vida
 
     acquire / release se conservan como alias de connect_client /
-    disconnect_client por compatibilidad con el código y las pruebas de M02/M03.
+    disconnect_client por compatibilidad con M01, M02, M03 y el stream_runner.
     """
 
     def __init__(self) -> None:
         self._session: Optional[CameraSession] = None
         self._lock = asyncio.Lock()
         self._events: deque[LifecycleRecord] = deque(maxlen=LIFECYCLE_EVENT_HISTORY)
-        # Clientes cuya sesión terminó por una acción externa → causa a comunicarles
-        self._ended_clients: dict[str, str] = {}
-        self._accepting = True
-        # Número consecutivo de eventos: ordena sin depender de la resolución del reloj
         self._seq = 0
+        # Slot entregado a cada cliente; se retira cuando el cliente se desconecta
+        self._client_slots: dict[str, FrameSlot] = {}
+        self._accepting = True
         # Cámara que se está cerrando en este momento (estado transitorio `stopping`)
         self._stopping_camera: Optional[str] = None
 
@@ -359,6 +443,10 @@ class CameraSessionManager:
         return self._session is not None
 
     @property
+    def is_accepting(self) -> bool:
+        return self._accepting
+
+    @property
     def state(self) -> SessionStatus:
         """Estado del ciclo de vida, independiente de la salud de la sesión."""
         if self._session is None:
@@ -369,24 +457,23 @@ class CameraSessionManager:
             return SessionStatus.STREAMING
         return SessionStatus.RUNNING
 
-    @property
-    def is_accepting(self) -> bool:
-        return self._accepting
-
     def get_status(self) -> dict:
-        """Estado serializable de la sesión actual y su historial de eventos."""
+        """Estado serializable de la sesión actual (contrato M01)."""
         if self._session is None:
-            status = {"status": SessionStatus.IDLE.value, "active_client": None}
-            if self._stopping_camera is not None:
-                status["camera_id"] = self._stopping_camera
-        else:
-            status = self._session.to_dict()
+            return {"status": SessionStatus.IDLE.value, "active_client": None}
+        return self._session.to_dict()
+
+    def get_lifecycle_status(self) -> dict:
+        """Estado de la sesión más el ciclo de vida y su historial de eventos."""
+        status = self.get_status()
+        if self._session is None and self._stopping_camera is not None:
+            status["camera_id"] = self._stopping_camera
         status["state"] = self.state.value
         status["accepting_clients"] = self._accepting
         status["events"] = [record.to_dict() for record in self._events]
         return status
 
-    # ── Ejecución de hardware ────────────────────────────────────────────────
+    # ── Ejecución ────────────────────────────────────────────────────────────
 
     async def _run_blocking(
         self,
@@ -394,13 +481,10 @@ class CameraSessionManager:
         *args: Any,
         on_orphan: Optional[Callable[[Any], None]] = None,
     ) -> Any:
-        """
-        Ejecuta una operación bloqueante de hardware en un hilo.
+        """Ejecuta una operación bloqueante de hardware en un hilo.
 
-        Si la tarea que espera se cancela, el hilo sigue trabajando. Por eso,
-        antes de dejar salir la cancelación (y con ella soltar el candado), se
-        espera a que el hilo termine. Si produjo un recurso que ya nadie va a
-        usar, `on_orphan` se encarga de cerrarlo.
+        Si la espera se cancela, `on_orphan` cierra el recurso que el hilo
+        llegue a producir y que ya nadie va a usar.
         """
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(None, fn, *args)
@@ -415,6 +499,24 @@ class CameraSessionManager:
                 await asyncio.wait({future})
             except asyncio.CancelledError:
                 pass
+            raise
+
+    async def _run_detached(
+        self, coro: Awaitable[Any], request: Optional[_Request] = None
+    ) -> Any:
+        """
+        Ejecuta la operación en una tarea propia y espera su resultado.
+
+        Si quien espera se cancela, la tarea sigue hasta terminar (y conserva
+        el candado mientras tanto). `request.abandoned` le avisa que nadie
+        recibirá el resultado, para que deshaga lo que ya no tiene dueño.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if request is not None:
+                request.abandoned = True
             raise
 
     # ── Transiciones internas (requieren `_lock` tomado) ─────────────────────
@@ -465,29 +567,48 @@ class CameraSessionManager:
                 "Verifique que esté conectada y no esté en uso."
             )
 
-        self._session = CameraSession(
+        session = CameraSession(
             camera_id=camera_id,
             capture=capture,
             status=SessionStatus.RUNNING,
             started_by=started_by,
             metrics=SessionMetrics(started_at=time.monotonic()),
         )
+        session.capture_task = asyncio.create_task(_capture_loop(session))
+        self._session = session
         self._record(LifecycleEvent.STARTED, camera_id=camera_id, reason=started_by.value)
-        return self._session
+        return session
 
-    def _detach_client(self, session: CameraSession, reason: str, client_code: Optional[str]) -> None:
+    def _detach_client(
+        self, session: CameraSession, reason: str, client_code: Optional[str]
+    ) -> None:
+        """Retira al cliente activo y cierra su slot con la causa, si la hay."""
         client_id = session.active_client
         session.active_client = None
         if session.status == SessionStatus.STREAMING:
             session.status = SessionStatus.RUNNING
         if client_code is not None:
-            self._ended_clients[client_id] = client_code
+            session.frames.close(CLIENT_END_DESCRIPTIONS[client_code], code=client_code)
+        else:
+            session.frames.close("El cliente se desconectó.")
         self._record(
             LifecycleEvent.CLIENT_DISCONNECTED,
             camera_id=session.camera_id,
             client_id=client_id,
             reason=reason,
         )
+
+    def _keep_or_close_after_client(self, session: CameraSession) -> bool:
+        """
+        Decide si la sesión sigue abierta tras irse su cliente.
+
+        Sigue abierta solo si la inició un operador y la captura sigue viva; en
+        ese caso el siguiente cliente recibe un slot nuevo.
+        """
+        if session.started_by == StartedBy.OPERATOR and session.capture_alive:
+            session.frames = FrameSlot()
+            return True
+        return False
 
     async def _close_session(self, reason: str, client_code: str) -> None:
         session = self._session
@@ -499,34 +620,33 @@ class CameraSessionManager:
         self._session = None
         self._stopping_camera = session.camera_id
         try:
-            await self._release_after_reads(session)
+            await self._close_capture(session)
         finally:
             self._stopping_camera = None
         self._record(LifecycleEvent.STOPPED, camera_id=session.camera_id, reason=reason)
 
-    async def _release_after_reads(self, session: CameraSession) -> None:
-        async with session.io_lock:  # espera la lectura en curso, si la hay
-            await self._run_blocking(_release_quietly, session.capture)
-
-    # ── Ejecución desacoplada ────────────────────────────────────────────────
-
-    async def _run_detached(
-        self, coro: Awaitable[Any], request: Optional[_Request] = None
-    ) -> Any:
+    async def _close_capture(self, session: CameraSession) -> None:
         """
-        Ejecuta la operación en una tarea propia y espera su resultado.
+        Detiene la captura y cierra la cámara, nunca a mitad de una lectura.
 
-        Si quien espera se cancela, la tarea sigue hasta terminar (y conserva
-        los candados mientras tanto). `request.abandoned` le avisa que nadie
-        recibirá el resultado, para que deshaga lo que ya no tiene dueño.
+        Si read_frame() sigue bloqueado tras detener la captura, release() del
+        driver no se ejecuta ahora: queda programado para cuando esa lectura
+        termine. La sesión se da por libre de inmediato para no retener al
+        siguiente cliente.
         """
-        task = asyncio.ensure_future(coro)
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if request is not None:
-                request.abandoned = True
-            raise
+            await _stop_capture(session)
+        finally:
+            read = session.pending_read
+            if read is not None and not read.done():
+                logger.warning(
+                    "Lectura de la cámara '%s' aún bloqueada; el cierre se "
+                    "difiere hasta que termine",
+                    session.camera_id,
+                )
+                _release_when_read_ends(read, session.capture)
+            else:
+                await self._run_blocking(_release_quietly, session.capture)
 
     # ── Operaciones públicas ─────────────────────────────────────────────────
 
@@ -534,7 +654,7 @@ class CameraSessionManager:
         self, camera_id: str, started_by: StartedBy = StartedBy.OPERATOR
     ) -> CameraSession:
         """
-        Abre la cámara y deja la sesión en `running`, sin cliente.
+        Abre la cámara y deja la sesión en `running`, capturando y sin cliente.
 
         Raises:
             SessionAlreadyActiveError: ya hay una sesión iniciada.
@@ -554,8 +674,8 @@ class CameraSessionManager:
 
     async def stop(self, reason: str = "operator") -> None:
         """
-        Cierra la sesión. Si hay un cliente conectado, se le notifica con
-        SESSION_STOPPED en su siguiente lectura.
+        Cierra la sesión. Si hay un cliente conectado, su slot se cierra con
+        SESSION_STOPPED.
 
         Raises:
             SessionNotActiveError: no hay sesión que detener.
@@ -572,9 +692,8 @@ class CameraSessionManager:
         """
         Asigna la sesión al cliente. Si la sesión está en `idle`, la inicia.
 
-        Si el cliente se cancela mientras espera, la conexión no se completa:
-        se deshace dentro del mismo candado, sin dejar la cámara asignada a
-        alguien que ya no existe.
+        El cliente consume `session.frames` tal como está al conectarse; ese
+        slot es suyo durante toda la conexión.
 
         Raises:
             SessionBusyError: ya hay un cliente activo.
@@ -595,20 +714,24 @@ class CameraSessionManager:
                 return None
             self._ensure_accepting()
             session = self._session
-            opened_here = False
-            if session is None:
-                session = await self._open_session(camera_id, StartedBy.CLIENT)
-                opened_here = True
-            elif session.active_client is not None:
+            if session is not None and session.active_client is not None:
                 raise SessionBusyError(
                     "La cámara ya está en uso por otro cliente. "
                     "Solo se permite un cliente activo a la vez."
                 )
-            elif session.camera_id != camera_id:
+            if session is not None and session.camera_id != camera_id:
                 raise CameraMismatchError(
                     f"La sesión activa usa la cámara '{session.camera_id}', "
                     f"no '{camera_id}'."
                 )
+            if session is not None and not session.capture_alive:
+                # La captura de una sesión de operador terminó sola: se reabre
+                await self._close_session("capture_ended", client_code="SESSION_STOPPED")
+                session = None
+
+            opened_here = session is None
+            if opened_here:
+                session = await self._open_session(camera_id, StartedBy.CLIENT)
 
             if request.abandoned:
                 # El cliente se fue mientras se abría la cámara
@@ -619,7 +742,7 @@ class CameraSessionManager:
             session.active_client = client_id
             if session.status != SessionStatus.ERROR:
                 session.status = SessionStatus.STREAMING
-            self._ended_clients.pop(client_id, None)
+            self._client_slots[client_id] = session.frames
             self._record(
                 LifecycleEvent.CLIENT_CONNECTED, camera_id=camera_id, client_id=client_id
             )
@@ -638,12 +761,12 @@ class CameraSessionManager:
 
     async def _disconnect_client(self, client_id: str, reason: str) -> bool:
         async with self._lock:
-            self._ended_clients.pop(client_id, None)
+            self._client_slots.pop(client_id, None)
             session = self._session
             if session is None or session.active_client != client_id:
                 return False
             self._detach_client(session, reason, client_code=None)
-            if session.started_by == StartedBy.CLIENT:
+            if not self._keep_or_close_after_client(session):
                 await self._close_session("auto_stop", client_code="SESSION_STOPPED")
             return True
 
@@ -651,8 +774,8 @@ class CameraSessionManager:
         """
         Expulsa al cliente activo por decisión de un operador.
 
-        El cliente recibe CLIENT_DISCONNECTED en su siguiente lectura. Si la
-        sesión la había iniciado el cliente, la cámara también se cierra.
+        Su slot se cierra con CLIENT_DISCONNECTED. Si la sesión la había
+        iniciado el cliente, la cámara también se cierra.
 
         Returns:
             El identificador del cliente desconectado.
@@ -669,33 +792,26 @@ class CameraSessionManager:
                 raise NoClientConnectedError("No hay un cliente conectado.")
             client_id = session.active_client
             self._detach_client(session, "operator", client_code="CLIENT_DISCONNECTED")
-            if session.started_by == StartedBy.CLIENT:
+            if not self._keep_or_close_after_client(session):
                 await self._close_session("auto_stop", client_code="SESSION_STOPPED")
             return client_id
 
-    async def read_frame(self, client_id: str) -> Optional[np.ndarray]:
+    async def next_frame(self, client_id: str, after_seq: int = 0) -> FramePacket:
         """
-        Lee un frame para el cliente activo.
+        Siguiente frame del slot del cliente, posterior a `after_seq`.
 
         Raises:
-            ClientSessionEndedError: la sesión del cliente terminó por una
-                acción externa; `code` indica la causa.
+            ClientSessionEndedError: la sesión del cliente terminó; `code`
+                indica la causa (SESSION_STOPPED, CLIENT_DISCONNECTED,
+                SERVICE_SHUTDOWN, CAMERA_NO_FRAMES, ...).
         """
-        session = self._session
-        if session is None or session.active_client != client_id:
-            raise self._ended_error(client_id)
-        return await self._run_detached(self._read_frame(session, client_id))
-
-    async def _read_frame(self, session: CameraSession, client_id: str) -> Optional[np.ndarray]:
-        async with session.io_lock:
-            if session.closed or session.active_client != client_id:
-                raise self._ended_error(client_id)
-            frame = await self._run_blocking(session.capture.read_frame)
-        session.update_frame(frame)
-        return frame
-
-    def _ended_error(self, client_id: str) -> ClientSessionEndedError:
-        return ClientSessionEndedError(self._ended_clients.pop(client_id, "SESSION_STOPPED"))
+        slot = self._client_slots.get(client_id)
+        if slot is None:
+            raise ClientSessionEndedError("SESSION_STOPPED")
+        try:
+            return await slot.next(after_seq)
+        except FrameSlotClosed as exc:
+            raise ClientSessionEndedError(exc.code) from exc
 
     async def shutdown(self) -> bool:
         """
@@ -751,7 +867,7 @@ class CameraSessionManager:
             cameras.sort(key=lambda cam: int(cam["id"]))
         return cameras
 
-    # ── Compatibilidad con M02/M03 ───────────────────────────────────────────
+    # ── Compatibilidad con M01, M02 y M03 ────────────────────────────────────
 
     async def acquire(self, camera_id: str, client_id: str) -> CameraSession:
         """Alias de connect_client."""
@@ -767,7 +883,7 @@ class CameraSessionManager:
         async with self._lock:
             self._accepting = True
             self._events.clear()
-            self._ended_clients.clear()
+            self._client_slots.clear()
             self._seq = 0
 
 

@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket
 
-from app.api.ws_camera import run_camera_stream
-from app.core.config import get_settings
 from app.schemas.inference import (
     AnomalyResponse,
     ClassificationResponse,
@@ -13,7 +9,6 @@ from app.schemas.inference import (
     ModelInfo,
     OCRResponse,
 )
-from app.services.camera_service import encode_ws_message
 from app.services.camera_session_manager import camera_session_manager
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
 from app.services.inference_service import InferenceError, inference_service
@@ -174,38 +169,17 @@ async def inference_stream(
     x2: int | None = Query(default=None),
     y2: int | None = Query(default=None),
 ) -> None:
-    """
-    Transmite frames con detecciones del modelo de localización.
+    def infer(frame) -> list[dict]:
+        # La captura entrega el frame completo; el ROI se aplica solo aquí.
+        cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
+        _, detections = inference_service.localize(cropped, model_id, conf, iou, offset)
+        return detections
 
-    Comparte la sesión y el ciclo de vida con `/ws/stream`: solo puede haber un
-    cliente entre ambos endpoints, y los mensajes, errores y códigos de cierre
-    son los mismos. Si la inferencia falla, el cliente recibe PROCESSING_ERROR
-    y la conexión se cierra con 1011.
-    """
-    settings = get_settings()
-    loop = asyncio.get_running_loop()
-    last_detections: list[dict] = []
-
-    async def on_frame(frame, session, frame_index: int) -> bytes:
-        nonlocal last_detections
-        if frame_index % infer_every_n_frames == 0:
-            cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
-            _, last_detections = await loop.run_in_executor(
-                None,
-                lambda: inference_service.localize(cropped, model_id, conf, iou, offset),
-            )
-        detections = last_detections
-        return await loop.run_in_executor(
-            None,
-            lambda: encode_ws_message(
-                frame, detections, session.metrics.fps_current, camera_id, settings.jpeg_quality
-            ),
-        )
-
-    await run_camera_stream(
+    await serve_camera_stream(
         websocket,
         camera_session_manager,
         camera_id,
-        on_frame,
-        welcome="Cámara detectada. Iniciando inferencia.",
+        "Cámara detectada. Iniciando inferencia.",
+        infer=infer,
+        infer_every_n_frames=infer_every_n_frames,
     )

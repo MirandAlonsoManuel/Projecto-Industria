@@ -1,6 +1,6 @@
 # M07 — Ciclo de vida de la sesión de cámara
 
-**Ticket:** OMC-88 · **Secuencia:** M07 · **Depende de:** M02 y M05
+**Ticket:** OMC-88 · **Secuencia:** M07 · **Se integra con:** M01 (contrato de la sesión) y el desacople de captura y WebSocket
 
 ## Alcance
 
@@ -10,6 +10,8 @@ Implementar el inicio, la detención, la consulta de estado, la conexión del ú
 
 Antes de M07, la cámara solo existía mientras un cliente estaba conectado al WebSocket: conectarse la abría y desconectarse la cerraba. Ahora la sesión tiene un ciclo de vida propio, con estados consultables, operaciones explícitas para administrarla y un historial de eventos que cuenta cómo transcurrió cada conexión.
 
+El ciclo de vida se construye sobre la captura desacoplada: la cámara se lee en una tarea propia de la sesión, que publica el frame más reciente en un `FrameSlot`, y los WebSocket consumen ese slot mediante `stream_runner` (ver `desacople-captura-websocket.md`).
+
 El frontend no necesita cambiar nada. Conectarse al WebSocket sigue iniciando la sesión por sí solo; las operaciones nuevas son para administración, pruebas y diagnóstico.
 
 ## Estados
@@ -17,7 +19,7 @@ El frontend no necesita cambiar nada. Conectarse al WebSocket sigue iniciando la
 | Estado | Cámara | Cliente | Cuándo ocurre |
 |---|---|---|---|
 | `idle` | Cerrada | Ninguno | Al arrancar el servidor, o después de detener la sesión |
-| `running` | Abierta | Ninguno | Un operador inició la sesión, o el cliente se fue de una sesión iniciada por operador |
+| `running` | Abierta y capturando | Ninguno | Un operador inició la sesión, o el cliente se fue de una sesión iniciada por operador |
 | `streaming` | Abierta | Uno | Hay un cliente recibiendo frames |
 | `stopping` | Cerrándose | Ninguno | Transitorio: el hardware se está liberando (en Windows tarda unos 300 ms) |
 
@@ -41,9 +43,9 @@ El campo `started_by` decide qué pasa cuando el cliente se va:
 | `started_by` | Cómo se inició | Al irse el cliente |
 |---|---|---|
 | `client` | El cliente se conectó con la sesión en `idle` | La cámara se cierra sola (`auto_stop`), igual que antes de M07 |
-| `operator` | Alguien llamó a `POST /cameras/session/start` | La cámara sigue abierta en `running`, lista para el siguiente cliente |
+| `operator` | Alguien llamó a `POST /cameras/session/start` | La cámara sigue abierta y capturando en `running`, lista para el siguiente cliente |
 
-Así, la cámara nunca queda encendida sin que alguien lo haya pedido, y un operador puede mantenerla abierta para evitar el costo de reabrir el hardware entre clientes.
+Así, la cámara nunca queda encendida sin que alguien lo haya pedido, y un operador puede mantenerla abierta para evitar el costo de reabrir el hardware entre clientes. Si la captura de una sesión de operador termina sola (por ejemplo, la cámara dejó de entregar frames), la sesión se cierra al irse el cliente, y el siguiente cliente la reabre.
 
 ## Interfaz
 
@@ -68,7 +70,7 @@ Las operaciones responden con una estructura uniforme. Cuando hay error, `data` 
 
 ### Consulta de estado
 
-`GET /cameras/session` conserva los campos de M02 (`status`, `camera_id`, `active_client`, `metrics`, `errors`) y agrega:
+`GET /cameras/session` conserva los campos de M02 y del desacople (`status`, `camera_id`, `active_client`, `metrics`, `delivery`, `errors`) y agrega:
 
 | Campo | Significado |
 |---|---|
@@ -78,6 +80,8 @@ Las operaciones responden con una estructura uniforme. Cuando hay error, `data` 
 | `events` | Historial de los últimos 50 eventos del ciclo de vida |
 
 `status` describe la salud de la sesión (puede ser `error` si la cámara falló), mientras que `state` describe en qué punto del ciclo está. Son preguntas distintas y por eso se reportan por separado.
+
+En el gestor, `get_status()` conserva exactamente el contrato de M01 (en `idle` responde `{"status": "idle", "active_client": null}`), y `get_lifecycle_status()` agrega los campos del ciclo de vida. El endpoint usa la segunda.
 
 ### Historial de eventos
 
@@ -93,7 +97,9 @@ Cada evento tiene un número consecutivo `seq`, que ordena los eventos sin ambig
 
 ### WebSocket
 
-`/ws/stream` y `/ws/inference-stream` comparten la misma sesión y el mismo flujo de conexión (`app/api/ws_camera.py`). Entre los dos solo puede haber un cliente a la vez, y ambos responden con los mismos mensajes y códigos.
+`/ws/stream` y `/ws/inference-stream` comparten la misma sesión y el mismo flujo de conexión (`serve_camera_stream` en `app/services/stream_runner.py`). Entre los dos solo puede haber un cliente a la vez, y ambos responden con los mismos mensajes y códigos.
+
+Cada cliente consume el slot que recibió al conectarse. Cuando un operador detiene la sesión, lo desconecta o el servicio se apaga, ese slot se cierra con el código de la causa, y `stream_runner` lo traduce en el mensaje y el código de cierre que recibe el cliente. Si la sesión sigue después de que el cliente se va, el siguiente recibe un slot nuevo.
 
 **Conexión aceptada** (primer mensaje):
 
@@ -130,7 +136,8 @@ Cada evento tiene un número consecutivo `seq`, que ordena los eventos sin ambig
 | `CLIENT_DISCONNECTED` | — | 1000 | Un operador expulsó al cliente |
 | `SERVICE_SHUTDOWN` | — | 1001 | El servidor se apagó con el cliente conectado |
 | `CAMERA_NO_FRAMES` | — | 1000 | La cámara dejó de entregar frames |
-| `PROCESSING_ERROR` | — | 1011 | Falló el procesamiento del frame (por ejemplo, la inferencia) |
+| `CAMERA_READ_ERROR` | — | 1011 | El driver lanzó una excepción al leer |
+| `STREAM_ERROR` | — | 1011 | Falló la inferencia o el envío |
 
 Una transición inválida nunca altera la sesión: el estado y el historial de eventos quedan exactamente como estaban.
 
@@ -155,15 +162,17 @@ INFO:     Application shutdown complete.
 
 **Modo compatible con el frontend.** El equipo pidió que el frontend siga conectándose directo al WebSocket, sin llamar a `start`. Por eso la conexión inicia la sesión cuando está en `idle`, y el campo `started_by` permite que esa sesión se cierre sola al irse el cliente.
 
-**Un solo flujo para los dos WebSocket.** El código que atiende la conexión estaba duplicado entre `/ws/stream` y `/ws/inference-stream`, con mensajes y manejo de errores distintos. Ahora ambos usan `run_camera_stream`, y solo cambia lo que cada uno hace con el frame. Esto garantiza la interfaz coherente que pide el criterio 1.
+**Integración con el desacople de captura.** M07 y el desacople de captura resolvieron en paralelo el mismo problema: un único flujo para los dos WebSocket. Al integrarlos se adoptó `stream_runner` y la captura en tarea propia, que ya estaban en `main`, y el ciclo de vida se construyó encima: la bienvenida agrega `client_id`, `state` y `started_by`, los rechazos usan cualquier `SessionError`, y los cierres por acción de un operador viajan como códigos del slot. El flujo propio de M07 (`ws_camera.py`) se eliminó para no duplicar responsabilidades, y se adoptaron los códigos del desacople (`STREAM_ERROR` en lugar de `PROCESSING_ERROR`).
 
-**Detener espera la lectura en curso.** Cada sesión tiene un candado de lectura (`io_lock`). Si alguien detiene la sesión mientras se lee un frame, el gestor espera a que esa lectura termine antes de liberar la cámara, en lugar de cerrarla a mitad.
+**Un slot por conexión.** Si el slot fuera de la sesión, expulsar a un cliente de una sesión de operador cerraría también la entrega para el siguiente. Por eso, cuando la sesión sigue abierta tras irse el cliente, la captura empieza a publicar en un slot nuevo.
+
+**Nunca cerrar la cámara a mitad de una lectura.** Se conserva la regla del desacople: al detener, la tarea de captura espera hasta `FRAME_STALE_TIMEOUT_S` a que termine la lectura en curso; si sigue bloqueada, la sesión queda libre y el cierre del driver se difiere hasta que esa lectura termine.
 
 **Operaciones resistentes a la cancelación.** FastAPI y Starlette usan anyio, que cancela tareas repitiendo la cancelación en cada `await`. Eso anulaba la protección de M03, que esperaba a que el hilo de hardware terminara antes de soltar el candado: la espera misma se cancelaba. Ahora cada operación del gestor corre en una tarea propia (`_run_detached`). Si quien la pidió se cancela, la operación termina igual, y si el cliente se fue mientras se abría la cámara, la apertura se deshace dentro del mismo candado. Una prueba reproduce esa cancelación y falla con el diseño anterior.
 
 **Estado transitorio `stopping`.** Liberar la cámara no es instantáneo. Sin este estado, la API reportaba `idle` mientras el hardware seguía cerrándose.
 
-**Compatibilidad con M02 y M03.** `acquire` y `release` se conservan como alias de `connect_client` y `disconnect_client`, y los campos de estado de M02 no cambian. Las pruebas de M02 y M03 pasan sin modificaciones.
+**Compatibilidad.** `acquire` y `release` se conservan como alias de `connect_client` y `disconnect_client`, y `get_status()` respeta el contrato de M01. Las pruebas de M01, M02, M03 y del desacople pasan sin modificaciones.
 
 ## Impacto en el frontend
 
@@ -189,7 +198,7 @@ python -m pytest -v
 
 | Archivo | Qué cubre |
 |---|---|
-| `tests/test_session_lifecycle.py` | Estados, transiciones válidas e inválidas, concurrencia, cancelación repetida y apagado global, a nivel gestor |
+| `tests/test_session_lifecycle.py` | Estados, transiciones válidas e inválidas, concurrencia, cancelación repetida y apagado global, a nivel gestor (con `next_frame`) |
 | `tests/test_ws_lifecycle.py` | Ciclo de vida a través de los dos WebSocket, mensajes de fin y códigos de cierre |
 | `tests/test_lifecycle_api.py` | Endpoints REST, respuestas de error y apagado global conectado al cierre de FastAPI |
 
@@ -218,18 +227,17 @@ Con el servidor en marcha (`uvicorn app.main:app --port 8000 --workers 1`), en P
 - **Un solo worker.** Los candados viven en la memoria del proceso; con varios workers de uvicorn, cada uno tendría su propio gestor.
 - **El apagado global es definitivo.** Después de `shutdown`, el gestor rechaza sesiones nuevas hasta reiniciar el servidor. No se expone como endpoint para evitar dejar el servicio inutilizable por error.
 - **Abrir la cámara tarda.** En Windows, `start` puede tardar entre 1 y 2 segundos por la inicialización del driver. Durante ese tiempo, otras operaciones esperan su turno.
-- **Inferencia sin modelos.** Si `ultralytics` no está instalado (`requirements-models.txt`), `/ws/inference-stream` responde `PROCESSING_ERROR`. Es el comportamiento esperado, no un defecto del ciclo de vida.
+- **Inferencia sin modelos.** Si `ultralytics` no está instalado (`requirements-models.txt`), `/ws/inference-stream` responde `STREAM_ERROR`. Es el comportamiento esperado, no un defecto del ciclo de vida.
+- **El slot entrega el último frame pendiente antes del cierre.** Al detener o expulsar, el cliente puede recibir un frame más antes del mensaje de fin. Es el comportamiento de `FrameSlot` del desacople.
 - **Configuración inconsistente, fuera del alcance.** `max_cameras` vale 4 en `config.py` mientras `MAX_CONCURRENT_CAMERAS` vale 1 en `limits.py`, y `ws_max_queue_size` no se usa.
 
 ## Archivos
 
 | Archivo | Cambio |
 |---|---|
-| `app/services/camera_session_manager.py` | Estados, operaciones, eventos, tareas desacopladas y estado `stopping` |
+| `app/services/camera_session_manager.py` | Estados, operaciones, eventos, slot por conexión, tareas desacopladas y estado `stopping`, sobre la captura del desacople |
+| `app/services/stream_runner.py` | Bienvenida con ciclo de vida, rechazos por `SessionError` y códigos de cierre por causa |
 | `app/core/limits.py` | Nueva constante `LIFECYCLE_EVENT_HISTORY` |
-| `app/api/ws_camera.py` | Nuevo: flujo compartido de los WebSocket |
-| `app/api/routers/stream.py` | Usa el flujo compartido |
-| `app/api/routers/inference.py` | `/ws/inference-stream` usa el flujo compartido; los endpoints REST de inferencia no cambian |
 | `app/api/routers/cameras.py` | Endpoints `start`, `stop` y `disconnect` |
 | `app/main.py` | Apagado global en el `lifespan` |
 | `tests/test_session_lifecycle.py`, `tests/test_ws_lifecycle.py`, `tests/test_lifecycle_api.py` | Nuevas pruebas |

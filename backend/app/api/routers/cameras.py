@@ -34,7 +34,7 @@ def _session_error(exc: SessionError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.http_status,
         content={
-            "data": camera_session_manager.get_status(),
+            "data": camera_session_manager.get_lifecycle_status(),
             "error": exc.code,
             "meta": {"description": str(exc)},
         },
@@ -96,7 +96,7 @@ async def list_cameras() -> JSONResponse:
 def session_status() -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content=camera_session_manager.get_status(),
+        content=camera_session_manager.get_lifecycle_status(),
     )
 
 
@@ -123,7 +123,7 @@ async def start_session(
     except SessionError as exc:
         return _session_error(exc)
     return _ok(
-        camera_session_manager.get_status(),
+        camera_session_manager.get_lifecycle_status(),
         f"Sesión iniciada con la cámara '{camera_id}'.",
         status_code=status.HTTP_201_CREATED,
     )
@@ -143,7 +143,7 @@ async def stop_session() -> JSONResponse:
         await camera_session_manager.stop()
     except SessionError as exc:
         return _session_error(exc)
-    return _ok(camera_session_manager.get_status(), "Sesión detenida.")
+    return _ok(camera_session_manager.get_lifecycle_status(), "Sesión detenida.")
 
 
 @router.post(
@@ -162,6 +162,6 @@ async def disconnect_client() -> JSONResponse:
     except SessionError as exc:
         return _session_error(exc)
     return _ok(
-        {"client_id": client_id, **camera_session_manager.get_status()},
+        {"client_id": client_id, **camera_session_manager.get_lifecycle_status()},
         f"Cliente '{client_id}' desconectado.",
     )
