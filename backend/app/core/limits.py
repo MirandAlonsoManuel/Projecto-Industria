@@ -22,3 +22,6 @@ FRAME_STALE_TIMEOUT_S: float = 5.0   # segundos sin frames antes de considerar s
 
 # ── Rendimiento ───────────────────────────────────────────────────────────────
 TARGET_FPS: int = 30              # FPS objetivo del loop de captura
+
+# ── Ciclo de vida ─────────────────────────────────────────────────────────────
+LIFECYCLE_EVENT_HISTORY: int = 50 # eventos del ciclo de vida conservados (circular)
