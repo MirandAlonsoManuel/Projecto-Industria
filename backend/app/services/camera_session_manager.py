@@ -32,6 +32,26 @@ Ciclo de vida de la sesión (M07):
   - Cualquier operación fuera de orden lanza un SessionError con código estable.
   - shutdown() es idempotente: libera lo que haya y deja de aceptar sesiones.
 
+Detección de cámara estancada (M10):
+
+  - La sesión registra su última actividad: la apertura de la cámara o el
+    último frame válido. Un frame vacío o un error del driver al leer ya no
+    terminan la captura; cuentan como frames perdidos.
+  - Un vigilante por sesión (`_watchdog_loop`) revisa cada WATCHDOG_INTERVAL_S
+    cuánto tiempo lleva la cámara sin frames válidos. Pasado
+    FRAME_STALE_TIMEOUT_S, la cámara está estancada, por uno de dos motivos:
+    `no_frames` (responde, pero sin imagen) o `read_timeout` (la lectura quedó
+    congelada en el driver).
+  - La recuperación ocurre dentro de `_lock`: detiene la captura, cierra la
+    cámara y solo entonces abre otra, con reintentos y esperas crecientes. El
+    cliente conserva su conexión y su slot; solo nota una pausa.
+  - Se respeta la regla del desacople: si la lectura sigue congelada, la cámara
+    no se cierra a la fuerza. La recuperación se declara fallida, el cierre del
+    driver se difiere y no se abre una segunda captura.
+  - Si la recuperación falla, o la cámara vuelve a estancarse sin entregar un
+    solo frame tras RECOVERY_MAX_ATTEMPTS recuperaciones seguidas, la sesión
+    se cierra y el cliente recibe CAMERA_STALLED.
+
 Concurrencia: toda transición ocurre dentro de `_lock`. Cada operación se
 ejecuta en una tarea propia del gestor (`_run_detached`): si quien la pidió se
 cancela, la operación termina igual. Esto es necesario porque anyio, que usan
@@ -63,7 +83,10 @@ from app.core.limits import (
     FRAME_STALE_TIMEOUT_S,
     LIFECYCLE_EVENT_HISTORY,
     MAX_ERROR_HISTORY,
+    RECOVERY_BACKOFF_S,
+    RECOVERY_MAX_ATTEMPTS,
     TARGET_FPS,
+    WATCHDOG_INTERVAL_S,
 )
 from app.services.camera_service import CameraCapture, open_camera
 from app.services.frame_slot import FramePacket, FrameSlot, FrameSlotClosed
@@ -72,6 +95,7 @@ logger = logging.getLogger(__name__)
 
 NO_FRAMES_CODE = "CAMERA_NO_FRAMES"
 READ_ERROR_CODE = "CAMERA_READ_ERROR"
+STALLED_CODE = "CAMERA_STALLED"
 _NO_FRAMES_MESSAGE = "La cámara dejó de enviar frames."
 
 # Descripción para el cliente cuando su sesión termina por una acción externa
@@ -79,6 +103,7 @@ CLIENT_END_DESCRIPTIONS: dict[str, str] = {
     "SESSION_STOPPED": "La sesión de cámara fue detenida.",
     "CLIENT_DISCONNECTED": "Un operador cerró esta conexión.",
     "SERVICE_SHUTDOWN": "El servicio se está apagando.",
+    STALLED_CODE: "La cámara dejó de producir frames y no se pudo recuperar.",
 }
 
 
@@ -89,6 +114,7 @@ class SessionStatus(str, Enum):
     RUNNING = "running"
     STOPPING = "stopping"
     STREAMING = "streaming"
+    RECOVERING = "recovering"
     ERROR = "error"
 
 
@@ -103,6 +129,14 @@ class LifecycleEvent(str, Enum):
     CLIENT_DISCONNECTED = "client_disconnected"
     STOPPED = "stopped"
     SHUTDOWN = "shutdown"
+    STALLED = "stalled"
+    RECOVERED = "recovered"
+    RECOVERY_FAILED = "recovery_failed"
+
+
+class StallReason(str, Enum):
+    NO_FRAMES = "no_frames"          # la cámara responde, pero solo con frames vacíos
+    READ_TIMEOUT = "read_timeout"    # la lectura quedó congelada en el driver
 
 
 # ── Estructuras de datos ──────────────────────────────────────────────────────
@@ -186,6 +220,29 @@ class DeliveryMetrics:
 
 
 @dataclass
+class RecoveryInfo:
+    """Resumen de las recuperaciones de la sesión."""
+
+    total: int = 0
+    # Recuperaciones seguidas sin que llegue un solo frame válido
+    consecutive: int = 0
+    last_reason: Optional[str] = None
+    last_started_ts: Optional[float] = None
+    last_attempts: int = 0
+    last_result: Optional[str] = None   # "recovered" o "failed"
+
+    def to_dict(self) -> dict:
+        return {
+            "total": self.total,
+            "consecutive": self.consecutive,
+            "last_reason": self.last_reason,
+            "last_started_ts": self.last_started_ts,
+            "last_attempts": self.last_attempts,
+            "last_result": self.last_result,
+        }
+
+
+@dataclass
 class CameraSession:
     camera_id: str
     capture: CameraCapture
@@ -206,6 +263,13 @@ class CameraSession:
     # Lectura de cámara en curso (o la última): mientras no termine, no se cierra.
     pending_read: Optional[asyncio.Future] = field(default=None, repr=False)
     closed: bool = False
+    # Vigilancia de actividad (M10)
+    watchdog_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    last_activity: float = field(default_factory=time.monotonic, repr=False)
+    last_activity_ts: float = field(default_factory=time.time)
+    reading_since: Optional[float] = field(default=None, repr=False)
+    recovering: bool = False
+    recovery: RecoveryInfo = field(default_factory=RecoveryInfo)
 
     @property
     def capture_alive(self) -> bool:
@@ -220,6 +284,16 @@ class CameraSession:
         self.last_frame = frame
         self.last_frame_ts = time.time()
         self.metrics.tick_frame()
+        self.mark_activity()
+        self.recovery.consecutive = 0
+
+    def mark_activity(self) -> None:
+        self.last_activity = time.monotonic()
+        self.last_activity_ts = time.time()
+
+    @property
+    def seconds_without_frames(self) -> float:
+        return time.monotonic() - self.last_activity
 
     def record_error(self, message: str) -> None:
         """Registra un error y transiciona el estado a ERROR."""
@@ -233,6 +307,9 @@ class CameraSession:
             "active_client": self.active_client,
             "started_by": self.started_by.value,
             "last_frame_ts": self.last_frame_ts or None,
+            "last_activity_ts": self.last_activity_ts,
+            "seconds_without_frames": round(self.seconds_without_frames, 2),
+            "recovery": self.recovery.to_dict(),
             "metrics": self.metrics.to_dict(),
             "delivery": self.delivery.to_dict(),
             "errors": [
@@ -345,52 +422,60 @@ async def _capture_loop(session: CameraSession) -> None:
     """
     Ciclo de adquisición: lee la cámara a su ritmo y publica en el slot vigente.
 
-    No conoce al cliente ni al WebSocket. Termina si la cámara deja de
-    entregar frames o si la tarea se cancela al liberar la sesión.
+    No conoce al cliente ni al WebSocket. Solo termina cuando la tarea se
+    cancela al liberar la sesión o al recuperarla. Un frame vacío o un error
+    del driver cuentan como frames perdidos: decidir si la cámara está
+    estancada le corresponde al vigilante, no a una lectura aislada (M10).
     """
     loop = asyncio.get_running_loop()
     interval = 1.0 / TARGET_FPS
-    try:
-        while True:
-            t0 = time.monotonic()
+    while True:
+        t0 = time.monotonic()
 
-            read = loop.run_in_executor(None, session.capture.read_frame)
-            session.pending_read = read
-            try:
-                frame = await asyncio.shield(read)
-            except asyncio.CancelledError:
-                # La lectura sigue en su hilo: se le da un margen para terminar.
-                # Si sigue bloqueada, el cierre de la cámara queda diferido
-                # (ver _close_capture); aquí nunca se libera a mitad de un read.
-                await asyncio.wait([read], timeout=FRAME_STALE_TIMEOUT_S)
-                raise
+        read = loop.run_in_executor(None, session.capture.read_frame)
+        session.pending_read = read
+        session.reading_since = t0
+        try:
+            frame = await asyncio.shield(read)
+        except asyncio.CancelledError:
+            # La lectura sigue en su hilo: se le da un margen para terminar.
+            # Si sigue bloqueada, el cierre de la cámara queda diferido
+            # (ver _close_capture); aquí nunca se libera a mitad de un read.
+            await asyncio.wait([read], timeout=FRAME_STALE_TIMEOUT_S)
+            raise
+        except Exception as exc:
+            logger.warning("Error del driver al leer la cámara '%s': %s", session.camera_id, exc)
+            session.errors.append(ErrorRecord(time.time(), f"Error al leer frame: {exc}"))
+            frame = None
+        finally:
+            session.reading_since = None
 
-            session.update_frame(frame)
-            if frame is None:
-                session.record_error(_NO_FRAMES_MESSAGE)
-                session.frames.close(_NO_FRAMES_MESSAGE, code=NO_FRAMES_CODE)
-                return
+        session.update_frame(frame)
+        if frame is not None:
             session.frames.publish(frame, session.last_frame_ts)
 
-            sleep_for = interval - (time.monotonic() - t0)
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.exception("Error del driver al leer la cámara '%s'", session.camera_id)
-        session.record_error(str(exc))
-        session.frames.close(str(exc), code=READ_ERROR_CODE)
+        sleep_for = interval - (time.monotonic() - t0)
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
 
 
-async def _stop_capture(session: CameraSession) -> None:
-    """Cancela la tarea de captura y espera a que termine. No propaga errores."""
-    task = session.capture_task
-    session.capture_task = None
-    if task is not None and not task.done():
+async def _cancel_and_wait(task: Optional[asyncio.Task]) -> None:
+    if task is not None and not task.done() and task is not asyncio.current_task():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    session.frames.close("Sesión de cámara liberada.")
+
+
+async def _stop_capture(session: CameraSession, close_slot: bool = True) -> None:
+    """Cancela la tarea de captura y espera a que termine. No propaga errores.
+
+    Durante una recuperación el slot no se cierra: el cliente sigue esperando
+    frames en él mientras la cámara se reabre.
+    """
+    task = session.capture_task
+    session.capture_task = None
+    await _cancel_and_wait(task)
+    if close_slot:
+        session.frames.close("Sesión de cámara liberada.")
 
 
 def _release_when_read_ends(read: asyncio.Future, capture: CameraCapture) -> None:
@@ -421,7 +506,27 @@ class CameraSessionManager:
     disconnect_client por compatibilidad con M01, M02, M03 y el stream_runner.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        stale_timeout_s: Optional[float] = None,
+        watchdog_interval_s: Optional[float] = None,
+        recovery_attempts: Optional[int] = None,
+        recovery_backoff_s: Optional[float] = None,
+    ) -> None:
+        # Los valores por defecto se leen de limits.py al crear el gestor
+        self.stale_timeout_s = (
+            FRAME_STALE_TIMEOUT_S if stale_timeout_s is None else stale_timeout_s
+        )
+        self.watchdog_interval_s = (
+            WATCHDOG_INTERVAL_S if watchdog_interval_s is None else watchdog_interval_s
+        )
+        self.recovery_attempts = (
+            RECOVERY_MAX_ATTEMPTS if recovery_attempts is None else recovery_attempts
+        )
+        self.recovery_backoff_s = (
+            RECOVERY_BACKOFF_S if recovery_backoff_s is None else recovery_backoff_s
+        )
         self._session: Optional[CameraSession] = None
         self._lock = asyncio.Lock()
         self._events: deque[LifecycleRecord] = deque(maxlen=LIFECYCLE_EVENT_HISTORY)
@@ -453,6 +558,8 @@ class CameraSessionManager:
             if self._stopping_camera is not None:
                 return SessionStatus.STOPPING
             return SessionStatus.IDLE
+        if self._session.recovering:
+            return SessionStatus.RECOVERING
         if self._session.active_client is not None:
             return SessionStatus.STREAMING
         return SessionStatus.RUNNING
@@ -469,6 +576,7 @@ class CameraSessionManager:
         if self._session is None and self._stopping_camera is not None:
             status["camera_id"] = self._stopping_camera
         status["state"] = self.state.value
+        status["stale_timeout_s"] = self.stale_timeout_s
         status["accepting_clients"] = self._accepting
         status["events"] = [record.to_dict() for record in self._events]
         return status
@@ -575,6 +683,7 @@ class CameraSessionManager:
             metrics=SessionMetrics(started_at=time.monotonic()),
         )
         session.capture_task = asyncio.create_task(_capture_loop(session))
+        session.watchdog_task = asyncio.create_task(self._watchdog_loop(session))
         self._session = session
         self._record(LifecycleEvent.STARTED, camera_id=camera_id, reason=started_by.value)
         return session
@@ -634,7 +743,10 @@ class CameraSessionManager:
         termine. La sesión se da por libre de inmediato para no retener al
         siguiente cliente.
         """
+        watchdog = session.watchdog_task
+        session.watchdog_task = None
         try:
+            await _cancel_and_wait(watchdog)
             await _stop_capture(session)
         finally:
             read = session.pending_read
@@ -834,6 +946,165 @@ class CameraSessionManager:
                 reason="released" if released else "already_idle",
             )
             return released
+
+    # ── Detección y recuperación de cámara estancada (M10) ──────────────────
+
+    def _stall_reason(self, session: CameraSession) -> Optional[StallReason]:
+        """
+        Motivo del estancamiento, o None si la cámara está activa.
+
+        Que haya una lectura en curso no basta para decir que está congelada:
+        la captura lee continuamente, así que casi siempre hay una. Una lectura
+        se considera congelada cuando lleva más de la mitad del umbral; una
+        lectura normal dura un intervalo de captura (unos 33 ms a 30 FPS).
+        """
+        if session.closed or session.recovering:
+            return None
+        if session.seconds_without_frames <= self.stale_timeout_s:
+            return None
+        reading_since = session.reading_since
+        if (
+            reading_since is not None
+            and time.monotonic() - reading_since > self.stale_timeout_s / 2
+        ):
+            return StallReason.READ_TIMEOUT
+        return StallReason.NO_FRAMES
+
+    def check_stall(self) -> Optional[StallReason]:
+        """Indica si la cámara de la sesión actual está estancada y por qué."""
+        session = self._session
+        return None if session is None else self._stall_reason(session)
+
+    async def _watchdog_loop(self, session: CameraSession) -> None:
+        """Vigila la actividad de la sesión y dispara la recuperación."""
+        while not session.closed:
+            await asyncio.sleep(self.watchdog_interval_s)
+            reason = self._stall_reason(session)
+            if reason is not None:
+                await self.recover(reason)
+
+    async def recover(self, reason: StallReason) -> bool:
+        """
+        Recuperación controlada de una cámara estancada.
+
+        Returns:
+            True si la cámara se recuperó. False si no había nada que recuperar
+            (la cámara volvió sola o la sesión terminó) o si la recuperación
+            falló; en ese caso la sesión se cierra y el cliente recibe
+            CAMERA_STALLED.
+        """
+        return await self._run_detached(self._recover(reason))
+
+    async def _recover(self, reason: StallReason) -> bool:
+        async with self._lock:
+            session = self._session
+            # Se confirma dentro del candado: el estado pudo cambiar mientras se esperaba
+            if session is None or self._stall_reason(session) is None:
+                return False
+
+            session.recovering = True
+            session.status = SessionStatus.RECOVERING
+            info = session.recovery
+            info.total += 1
+            info.consecutive += 1
+            info.last_reason = reason.value
+            info.last_started_ts = time.time()
+            info.last_attempts = 0
+            info.last_result = None
+            self._record(
+                LifecycleEvent.STALLED,
+                camera_id=session.camera_id,
+                client_id=session.active_client,
+                reason=reason.value,
+            )
+
+            # 1. Detener la captura sin cerrar el slot del cliente
+            await _stop_capture(session, close_slot=False)
+
+            # 2. Nunca cerrar a mitad de una lectura: si sigue congelada, no es
+            #    seguro abrir otra captura del mismo dispositivo.
+            read = session.pending_read
+            if read is not None and not read.done():
+                _release_when_read_ends(read, session.capture)
+                await self._fail_recovery(session, reason, "lectura congelada; cierre diferido")
+                return False
+
+            await self._run_blocking(_release_quietly, session.capture)
+
+            # 3. Si la cámara ya se recuperó varias veces sin entregar un solo
+            #    frame, reabrirla otra vez no tiene sentido.
+            if info.consecutive > self.recovery_attempts:
+                await self._fail_recovery(
+                    session, reason, f"sin frames tras {self.recovery_attempts} recuperaciones"
+                )
+                return False
+
+            # 4. Reabrir con esperas crecientes
+            for attempt in range(1, self.recovery_attempts + 1):
+                await asyncio.sleep(self.recovery_backoff_s * 2 ** (attempt - 1))
+                info.last_attempts = attempt
+                capture = await self._try_open(session.camera_id)
+                if capture is None:
+                    continue
+                session.capture = capture
+                session.pending_read = None
+                session.mark_activity()
+                session.recovering = False
+                session.status = (
+                    SessionStatus.STREAMING
+                    if session.active_client is not None
+                    else SessionStatus.RUNNING
+                )
+                info.last_result = "recovered"
+                session.capture_task = asyncio.create_task(_capture_loop(session))
+                self._record(
+                    LifecycleEvent.RECOVERED,
+                    camera_id=session.camera_id,
+                    client_id=session.active_client,
+                    reason=f"{reason.value}; intento {attempt}",
+                )
+                return True
+
+            await self._fail_recovery(
+                session, reason, f"no se pudo reabrir en {self.recovery_attempts} intentos"
+            )
+            return False
+
+    async def _try_open(self, camera_id: str) -> Optional[CameraCapture]:
+        try:
+            return await self._run_blocking(
+                open_camera, camera_id, on_orphan=_release_quietly
+            )
+        except Exception:
+            logger.exception("Error del driver al reabrir la cámara '%s'", camera_id)
+            return None
+
+    async def _fail_recovery(
+        self, session: CameraSession, reason: StallReason, detail: str
+    ) -> None:
+        """Cierra la sesión tras una recuperación fallida.
+
+        La captura ya está liberada o con su cierre diferido: no se vuelve a tocar.
+        """
+        session.recovery.last_result = "failed"
+        session.recovering = False
+        session.record_error(f"Recuperación fallida ({reason.value}): {detail}")
+        self._record(
+            LifecycleEvent.RECOVERY_FAILED,
+            camera_id=session.camera_id,
+            client_id=session.active_client,
+            reason=f"{reason.value}; {detail}",
+        )
+        if session.active_client is not None:
+            self._detach_client(session, "recovery_failed", client_code=STALLED_CODE)
+        session.closed = True
+        self._session = None
+        session.frames.close("Sesión de cámara liberada.")
+        self._record(LifecycleEvent.STOPPED, camera_id=session.camera_id, reason="recovery_failed")
+        # El estado queda consistente antes de cualquier espera; luego se retira el vigilante
+        watchdog = session.watchdog_task
+        session.watchdog_task = None
+        await _cancel_and_wait(watchdog)
 
     async def scan_cameras(
         self, detector: Callable[..., list[dict]]
