@@ -427,3 +427,72 @@ def test_c4_shutdown_compite_con_conexiones_sin_dejar_camara_abierta(manager, ca
     assert stats.active == 0
     assert manager.state == SessionStatus.IDLE
     assert manager.is_accepting is False
+
+
+def test_c1_estado_stopping_mientras_se_libera_la_camara(manager, monkeypatch, stats):
+    """El cierre del hardware no es instantáneo; el estado lo refleja."""
+    liberando = threading.Event()
+    continuar = threading.Event()
+
+    class SlowReleaseCapture(FakeCapture):
+        def release(self) -> None:
+            liberando.set()
+            continuar.wait(timeout=2)
+            super().release()
+
+    monkeypatch.setattr(
+        manager_module, "open_camera", lambda source: SlowReleaseCapture(stats, 0.0)
+    )
+
+    async def escenario():
+        await manager.start("0")
+        cierre = asyncio.create_task(manager.stop())
+        await asyncio.get_running_loop().run_in_executor(None, liberando.wait, 2)
+        estado_durante = manager.get_status()
+        continuar.set()
+        await cierre
+        return estado_durante
+
+    estado_durante = run(escenario())
+
+    assert estado_durante["state"] == "stopping"
+    assert estado_durante["camera_id"] == "0"
+    assert manager.state == SessionStatus.IDLE
+
+
+def test_c3_cancelacion_repetida_no_deja_camara_asignada(manager, monkeypatch, stats):
+    """anyio repite la cancelación en cada await; el gestor debe resistirlo.
+
+    La primera apertura es lenta y su cliente se cancela a mitad; la segunda es
+    inmediata. Si el gestor soltara el candado antes de tiempo, la segunda
+    abriría la cámara mientras la primera aún la está abriendo.
+    """
+    import anyio
+
+    demoras = iter([0.1, 0.0])
+
+    def open_camera_variable(source: str):
+        time.sleep(next(demoras, 0.0))
+        return FakeCapture(stats, 0.0)
+
+    monkeypatch.setattr(manager_module, "open_camera", open_camera_variable)
+
+    async def cliente_que_se_va() -> None:
+        with anyio.CancelScope() as scope:
+            tarea_cancelar = asyncio.get_running_loop().call_later(0.03, scope.cancel)
+            try:
+                await manager.connect_client("0", "fugaz")
+            finally:
+                # Igual que el `finally` de un WebSocket, bajo cancelación activa
+                await manager.disconnect_client("fugaz")
+            tarea_cancelar.cancel()
+
+    async def escenario():
+        await cliente_que_se_va()
+        await manager.connect_client("0", "siguiente")
+
+    run(escenario())
+
+    assert manager.session.active_client == "siguiente"
+    assert stats.max_active == 1
+    assert stats.active == 1
