@@ -6,6 +6,7 @@ Pruebas de `InferenceEngineLifecycle` (E02), usando exclusivamente
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -22,6 +23,21 @@ class _CountingSimulatedEngine(SimulatedInferenceEngine):
 
     def load(self) -> None:
         self.load_calls += 1
+        super().load()
+
+
+class _SlowLoadEngine(SimulatedInferenceEngine):
+    """
+    Motor simulado cuya carga tarda un poco (bloqueando el hilo del
+    executor, no el event loop). Existe solo para la prueba de
+    cancelación: sin esta demora, `task.cancel()` llamado inmediatamente
+    después de crear la tarea cancela ANTES de que `initialize()` llegue
+    a ejecutar una sola línea — no probaría nada sobre la cancelación en
+    sí, solo que una tarea nunca iniciada no corre.
+    """
+
+    def load(self) -> None:
+        time.sleep(0.2)
         super().load()
 
 
@@ -169,9 +185,11 @@ async def test_initialize_despues_de_closed_lanza_error():
 
 @pytest.mark.asyncio
 async def test_cancelacion_durante_initialize_transiciona_a_error():
-    lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
+    lifecycle = InferenceEngineLifecycle(_SlowLoadEngine())
 
     task = asyncio.ensure_future(lifecycle.initialize())
+    await asyncio.sleep(0.05)  # dejar que initialize() entre a run_in_executor
+    assert lifecycle.get_status().state == LifecycleState.LOADING  # confirma que ya estaba en curso
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
