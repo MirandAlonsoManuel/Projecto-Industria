@@ -55,6 +55,7 @@ CLOSE_CODES: dict[str, int] = {
     "SERVICE_SHUTTING_DOWN": 1001,   # el servidor se está apagando
     "SERVICE_SHUTDOWN": 1001,
     "CAMERA_READ_ERROR": 1011,
+    "CAMERA_STALLED": 1011,          # la cámara se estancó y no se pudo recuperar
     STREAM_ERROR_CODE: 1011,
 }
 

@@ -183,19 +183,36 @@ def test_desconexion_detiene_la_captura_antes_de_liberar():
 
 
 def test_camara_sin_frames_notifica_y_cierra():
+    """
+    M10: un frame vacío ya no cierra la conexión de inmediato. Si la cámara deja
+    de producir frames, el vigilante intenta recuperarla; si tras las
+    recuperaciones sigue sin frames, se notifica CAMERA_STALLED y se cierra.
+    """
+    capturas: list[FakeCapture] = []
+
+    def abrir(_source):
+        # La primera entrega 3 frames; las reaperturas ya no entregan ninguno
+        captura = FakeCapture(max_frames=3 if not capturas else 0)
+        capturas.append(captura)
+        return captura
+
     async def scenario():
         ws = FakeWebSocket()
-        capture = FakeCapture(max_frames=3)
-        manager = CameraSessionManager()
-        await _serve_until_closed(ws, capture, manager)
-        return ws, capture, manager
+        manager = CameraSessionManager(
+            stale_timeout_s=0.1, watchdog_interval_s=0.02, recovery_backoff_s=0.01
+        )
+        with patch("app.services.camera_session_manager.open_camera", side_effect=abrir):
+            await asyncio.wait_for(serve_camera_stream(ws, manager, "0", "listo"), timeout=5)
+        await asyncio.sleep(0.05)
+        return ws, manager
 
-    ws, capture, manager = asyncio.run(scenario())
+    ws, manager = asyncio.run(scenario())
 
     assert ws.json_messages[-1]["connected"] is False
-    assert ws.json_messages[-1]["error"] == "CAMERA_NO_FRAMES"
-    assert ws.close_code == 1000
-    assert capture.release_calls == 1
+    assert ws.json_messages[-1]["error"] == "CAMERA_STALLED"
+    assert ws.close_code == 1011
+    assert len(capturas) > 1  # hubo reaperturas antes de rendirse
+    assert all(c.release_calls == 1 for c in capturas)  # cada captura se cerró una vez
     assert manager.session is None
 
 
