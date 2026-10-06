@@ -37,6 +37,7 @@ from app.services.camera_session_manager import (
     SessionError,
 )
 from app.services.frame_slot import FrameSlot, FrameSlotClosed
+from app.services.redaction import redact_source, redact_text
 from app.services.stream_protocol import encode_ws_message
 
 InferFn = Callable[[np.ndarray], list]
@@ -183,10 +184,14 @@ async def _run_tasks(
         return
     if isinstance(error, FrameSlotClosed):
         close_code = CLOSE_CODES.get(error.code, 1011)
-        await _notify_and_close(websocket, camera_id, error.code, str(error), close_code)
+        await _notify_and_close(
+            websocket, camera_id, error.code, redact_text(str(error)), close_code
+        )
         return
     session.record_error(str(error))
-    await _notify_and_close(websocket, camera_id, STREAM_ERROR_CODE, str(error), 1011)
+    await _notify_and_close(
+        websocket, camera_id, STREAM_ERROR_CODE, redact_text(str(error)), 1011
+    )
 
 
 async def serve_camera_stream(
@@ -213,12 +218,18 @@ async def serve_camera_stream(
     await websocket.accept()
     client_id = str(uuid.uuid4())
 
+    # La cámara se abre con la fuente real; al cliente solo le llega la versión
+    # sin credenciales (M12).
+    public_id = redact_source(camera_id)
+
     try:
         session = await manager.acquire(camera_id, client_id)
     except SessionError as exc:
-        description = _BUSY_DESCRIPTION if exc.code == "CAMERA_BUSY" else str(exc)
+        description = (
+            _BUSY_DESCRIPTION if exc.code == "CAMERA_BUSY" else redact_text(str(exc), camera_id)
+        )
         await _notify_and_close(
-            websocket, camera_id, exc.code, description, CLOSE_CODES.get(exc.code, 1011)
+            websocket, public_id, exc.code, description, CLOSE_CODES.get(exc.code, 1011)
         )
         return
 
@@ -230,7 +241,7 @@ async def serve_camera_stream(
         await websocket.send_json(
             {
                 "connected": True,
-                "camera_id": camera_id,
+                "camera_id": public_id,
                 "client_id": client_id,
                 "state": manager.state.value,
                 "started_by": session.started_by.value,
@@ -238,7 +249,7 @@ async def serve_camera_stream(
                 "description": ready_description,
             }
         )
-        await _run_tasks(websocket, session, slot, camera_id, infer, infer_every_n_frames)
+        await _run_tasks(websocket, session, slot, public_id, infer, infer_every_n_frames)
     except WebSocketDisconnect:
         pass
     finally:

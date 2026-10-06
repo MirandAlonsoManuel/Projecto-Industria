@@ -52,6 +52,16 @@ Detección de cámara estancada (M10):
     solo frame tras RECOVERY_MAX_ATTEMPTS recuperaciones seguidas, la sesión
     se cierra y el cliente recibe CAMERA_STALLED.
 
+Métricas operativas (M12):
+
+  - get_metrics() reúne en una sola consulta el estado de la cámara, el único
+    cliente (0 o 1), los frames capturados, perdidos, enviados y saltados, las
+    recuperaciones y el último error, para la sesión actual y acumulados desde
+    que arrancó el servicio.
+  - Ninguna salida expone credenciales: la cámara se abre con la fuente real,
+    pero estado, métricas, eventos, errores y logs usan la versión enmascarada
+    (ver app/services/redaction.py).
+
 Concurrencia: toda transición ocurre dentro de `_lock`. Cada operación se
 ejecuta en una tarea propia del gestor (`_run_detached`): si quien la pidió se
 cancela, la operación termina igual. Esto es necesario porque anyio, que usan
@@ -90,6 +100,7 @@ from app.core.limits import (
 )
 from app.services.camera_service import CameraCapture, open_camera
 from app.services.frame_slot import FramePacket, FrameSlot, FrameSlotClosed
+from app.services.redaction import redact_source, redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +235,7 @@ class RecoveryInfo:
     """Resumen de las recuperaciones de la sesión."""
 
     total: int = 0
+    failed: int = 0
     # Recuperaciones seguidas sin que llegue un solo frame válido
     consecutive: int = 0
     last_reason: Optional[str] = None
@@ -234,6 +246,7 @@ class RecoveryInfo:
     def to_dict(self) -> dict:
         return {
             "total": self.total,
+            "failed": self.failed,
             "consecutive": self.consecutive,
             "last_reason": self.last_reason,
             "last_started_ts": self.last_started_ts,
@@ -270,6 +283,14 @@ class CameraSession:
     reading_since: Optional[float] = field(default=None, repr=False)
     recovering: bool = False
     recovery: RecoveryInfo = field(default_factory=RecoveryInfo)
+    # Métricas (M12)
+    errors_total: int = 0
+    connected_since: Optional[float] = None
+
+    @property
+    def public_id(self) -> Optional[str]:
+        """Identificador de la cámara sin credenciales, para cualquier salida."""
+        return redact_source(self.camera_id)
 
     @property
     def capture_alive(self) -> bool:
@@ -297,12 +318,19 @@ class CameraSession:
 
     def record_error(self, message: str) -> None:
         """Registra un error y transiciona el estado a ERROR."""
-        self.errors.append(ErrorRecord(timestamp=time.time(), message=message))
+        self.note_error(message)
         self.status = SessionStatus.ERROR
+
+    def note_error(self, message: str) -> None:
+        """Registra un error sin cambiar el estado (por ejemplo, una lectura fallida)."""
+        self.errors.append(
+            ErrorRecord(timestamp=time.time(), message=redact_text(message, self.camera_id))
+        )
+        self.errors_total += 1
 
     def to_dict(self) -> dict:
         return {
-            "camera_id": self.camera_id,
+            "camera_id": self.public_id,
             "status": self.status.value,
             "active_client": self.active_client,
             "started_by": self.started_by.value,
@@ -313,10 +341,41 @@ class CameraSession:
             "metrics": self.metrics.to_dict(),
             "delivery": self.delivery.to_dict(),
             "errors": [
-                {"timestamp": e.timestamp, "message": e.message}
+                {"timestamp": e.timestamp, "message": redact_text(e.message, self.camera_id)}
                 for e in self.errors
             ],
         }
+
+
+@dataclass
+class ServiceCounters:
+    """Acumulados de las sesiones ya cerradas, desde que arrancó el servicio."""
+
+    started_at: float = field(default_factory=time.time)
+    started_mono: float = field(default_factory=time.monotonic)
+    sessions_started: int = 0
+    client_connections: int = 0
+    client_rejections: int = 0
+    frames_captured: int = 0
+    frames_dropped: int = 0
+    frames_sent: int = 0
+    frames_skipped: int = 0
+    recoveries: int = 0
+    recoveries_failed: int = 0
+    errors_total: int = 0
+    last_error: Optional[ErrorRecord] = None
+
+    def absorb(self, session: "CameraSession") -> None:
+        """Suma los contadores de una sesión que terminó."""
+        self.frames_captured += session.metrics.frames_total
+        self.frames_dropped += session.metrics.frames_dropped
+        self.frames_sent += session.delivery.frames_sent
+        self.frames_skipped += session.delivery.frames_skipped
+        self.recoveries += session.recovery.total - session.recovery.failed
+        self.recoveries_failed += session.recovery.failed
+        self.errors_total += session.errors_total
+        if session.errors:
+            self.last_error = session.errors[-1]
 
 
 # ── Excepciones ───────────────────────────────────────────────────────────────
@@ -444,8 +503,12 @@ async def _capture_loop(session: CameraSession) -> None:
             await asyncio.wait([read], timeout=FRAME_STALE_TIMEOUT_S)
             raise
         except Exception as exc:
-            logger.warning("Error del driver al leer la cámara '%s': %s", session.camera_id, exc)
-            session.errors.append(ErrorRecord(time.time(), f"Error al leer frame: {exc}"))
+            logger.warning(
+                "Error del driver al leer la cámara '%s': %s",
+                session.public_id,
+                redact_text(str(exc), session.camera_id),
+            )
+            session.note_error(f"Error al leer frame: {exc}")
             frame = None
         finally:
             session.reading_since = None
@@ -528,6 +591,9 @@ class CameraSessionManager:
             RECOVERY_BACKOFF_S if recovery_backoff_s is None else recovery_backoff_s
         )
         self._session: Optional[CameraSession] = None
+        # Sesión que se está cerrando: sus métricas siguen contando hasta absorberse
+        self._closing: Optional[CameraSession] = None
+        self._service = ServiceCounters()
         self._lock = asyncio.Lock()
         self._events: deque[LifecycleRecord] = deque(maxlen=LIFECYCLE_EVENT_HISTORY)
         self._seq = 0
@@ -580,6 +646,104 @@ class CameraSessionManager:
         status["accepting_clients"] = self._accepting
         status["events"] = [record.to_dict() for record in self._events]
         return status
+
+    def get_metrics(self) -> dict:
+        """
+        Métricas operativas de la única cámara (M12).
+
+        `session` describe la sesión actual (en cero si no hay); `since_start`
+        suma las sesiones cerradas más la actual, desde que arrancó el servicio.
+        Ningún campo contiene credenciales.
+        """
+        session = self._session or self._closing
+        svc = self._service
+        now = time.time()
+
+        if session is not None:
+            frames_session = {
+                "captured": session.metrics.frames_total,
+                "dropped": session.metrics.frames_dropped,
+                "sent": session.delivery.frames_sent,
+                "skipped": session.delivery.frames_skipped,
+            }
+            recoveries_session = {
+                "recovered": session.recovery.total - session.recovery.failed,
+                "failed": session.recovery.failed,
+            }
+            errors_session = session.errors_total
+        else:
+            frames_session = {"captured": 0, "dropped": 0, "sent": 0, "skipped": 0}
+            recoveries_session = {"recovered": 0, "failed": 0}
+            errors_session = 0
+
+        frames_total = {
+            "captured": svc.frames_captured + frames_session["captured"],
+            "dropped": svc.frames_dropped + frames_session["dropped"],
+            "sent": svc.frames_sent + frames_session["sent"],
+            "skipped": svc.frames_skipped + frames_session["skipped"],
+        }
+
+        last_error_record = (
+            session.errors[-1] if session is not None and session.errors else svc.last_error
+        )
+        last_error = None
+        if last_error_record is not None:
+            last_error = {
+                "timestamp": last_error_record.timestamp,
+                "message": redact_text(
+                    last_error_record.message, session.camera_id if session else None
+                ),
+            }
+
+        active = self._session
+        client_connected = 1 if active is not None and active.active_client is not None else 0
+
+        return {
+            "timestamp": now,
+            "camera": {
+                "camera_id": session.public_id if session is not None else None,
+                "state": self.state.value,
+                "health": (
+                    None if session is None
+                    else "error" if session.status == SessionStatus.ERROR
+                    else "ok"
+                ),
+                "started_by": session.started_by.value if session is not None else None,
+                "fps_current": round(session.metrics.fps_current, 2) if session else 0.0,
+                "uptime_seconds": round(session.metrics.uptime_seconds, 1) if session else 0.0,
+                "last_activity_ts": session.last_activity_ts if session else None,
+                "seconds_without_frames": (
+                    round(session.seconds_without_frames, 2) if session else None
+                ),
+                "stale_timeout_s": self.stale_timeout_s,
+            },
+            "client": {
+                "connected": client_connected,
+                "client_id": active.active_client if client_connected else None,
+                "connected_since": active.connected_since if client_connected else None,
+                "connections_total": svc.client_connections,
+                "rejections_total": svc.client_rejections,
+            },
+            "frames": {"session": frames_session, "since_start": frames_total},
+            "recoveries": {
+                "session": recoveries_session,
+                "since_start": {
+                    "recovered": svc.recoveries + recoveries_session["recovered"],
+                    "failed": svc.recoveries_failed + recoveries_session["failed"],
+                },
+            },
+            "errors": {
+                "session": errors_session,
+                "since_start": svc.errors_total + errors_session,
+            },
+            "last_error": last_error,
+            "service": {
+                "started_at": svc.started_at,
+                "uptime_seconds": round(time.monotonic() - svc.started_mono, 1),
+                "sessions_started": svc.sessions_started,
+                "accepting_clients": self._accepting,
+            },
+        }
 
     # ── Ejecución ────────────────────────────────────────────────────────────
 
@@ -637,6 +801,7 @@ class CameraSessionManager:
         client_id: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> None:
+        camera_id = redact_source(camera_id)
         self._seq += 1
         self._events.append(
             LifecycleRecord(
@@ -666,12 +831,13 @@ class CameraSessionManager:
             )
         except Exception as exc:
             raise SessionCameraError(
-                f"Error del driver al abrir la cámara '{camera_id}': {exc}"
+                f"Error del driver al abrir la cámara '{redact_source(camera_id)}': "
+                f"{redact_text(str(exc), camera_id)}"
             ) from exc
 
         if capture is None:
             raise SessionCameraError(
-                f"No se pudo abrir la cámara '{camera_id}'. "
+                f"No se pudo abrir la cámara '{redact_source(camera_id)}'. "
                 "Verifique que esté conectada y no esté en uso."
             )
 
@@ -685,6 +851,7 @@ class CameraSessionManager:
         session.capture_task = asyncio.create_task(_capture_loop(session))
         session.watchdog_task = asyncio.create_task(self._watchdog_loop(session))
         self._session = session
+        self._service.sessions_started += 1
         self._record(LifecycleEvent.STARTED, camera_id=camera_id, reason=started_by.value)
         return session
 
@@ -694,6 +861,7 @@ class CameraSessionManager:
         """Retira al cliente activo y cierra su slot con la causa, si la hay."""
         client_id = session.active_client
         session.active_client = None
+        session.connected_since = None
         if session.status == SessionStatus.STREAMING:
             session.status = SessionStatus.RUNNING
         if client_code is not None:
@@ -727,11 +895,14 @@ class CameraSessionManager:
         # no queda secuestrado. `_lock` sigue tomado, así nadie abre mientras tanto.
         session.closed = True
         self._session = None
-        self._stopping_camera = session.camera_id
+        self._closing = session
+        self._stopping_camera = session.public_id
         try:
             await self._close_capture(session)
         finally:
             self._stopping_camera = None
+            self._closing = None
+            self._service.absorb(session)
         self._record(LifecycleEvent.STOPPED, camera_id=session.camera_id, reason=reason)
 
     async def _close_capture(self, session: CameraSession) -> None:
@@ -754,7 +925,7 @@ class CameraSessionManager:
                 logger.warning(
                     "Lectura de la cámara '%s' aún bloqueada; el cierre se "
                     "difiere hasta que termine",
-                    session.camera_id,
+                    session.public_id,
                 )
                 _release_when_read_ends(read, session.capture)
             else:
@@ -780,7 +951,7 @@ class CameraSessionManager:
             self._ensure_accepting()
             if self._session is not None:
                 raise SessionAlreadyActiveError(
-                    f"Ya hay una sesión activa con la cámara '{self._session.camera_id}'."
+                    f"Ya hay una sesión activa con la cámara '{self._session.public_id}'."
                 )
             return await self._open_session(camera_id, started_by)
 
@@ -814,9 +985,13 @@ class CameraSessionManager:
             ServiceShuttingDownError: el servicio se está apagando.
         """
         request = _Request()
-        return await self._run_detached(
-            self._connect_client(camera_id, client_id, request), request
-        )
+        try:
+            return await self._run_detached(
+                self._connect_client(camera_id, client_id, request), request
+            )
+        except (SessionBusyError, CameraMismatchError, ServiceShuttingDownError):
+            self._service.client_rejections += 1
+            raise
 
     async def _connect_client(
         self, camera_id: str, client_id: str, request: _Request
@@ -833,8 +1008,8 @@ class CameraSessionManager:
                 )
             if session is not None and session.camera_id != camera_id:
                 raise CameraMismatchError(
-                    f"La sesión activa usa la cámara '{session.camera_id}', "
-                    f"no '{camera_id}'."
+                    f"La sesión activa usa la cámara '{session.public_id}', "
+                    f"no '{redact_source(camera_id)}'."
                 )
             if session is not None and not session.capture_alive:
                 # La captura de una sesión de operador terminó sola: se reabre
@@ -852,9 +1027,11 @@ class CameraSessionManager:
                 return None
 
             session.active_client = client_id
+            session.connected_since = time.time()
             if session.status != SessionStatus.ERROR:
                 session.status = SessionStatus.STREAMING
             self._client_slots[client_id] = session.frames
+            self._service.client_connections += 1
             self._record(
                 LifecycleEvent.CLIENT_CONNECTED, camera_id=camera_id, client_id=client_id
             )
@@ -1075,8 +1252,12 @@ class CameraSessionManager:
             return await self._run_blocking(
                 open_camera, camera_id, on_orphan=_release_quietly
             )
-        except Exception:
-            logger.exception("Error del driver al reabrir la cámara '%s'", camera_id)
+        except Exception as exc:
+            logger.warning(
+                "Error del driver al reabrir la cámara '%s': %s",
+                redact_source(camera_id),
+                redact_text(str(exc), camera_id),
+            )
             return None
 
     async def _fail_recovery(
@@ -1087,6 +1268,7 @@ class CameraSessionManager:
         La captura ya está liberada o con su cierre diferido: no se vuelve a tocar.
         """
         session.recovery.last_result = "failed"
+        session.recovery.failed += 1
         session.recovering = False
         session.record_error(f"Recuperación fallida ({reason.value}): {detail}")
         self._record(
@@ -1099,6 +1281,7 @@ class CameraSessionManager:
             self._detach_client(session, "recovery_failed", client_code=STALLED_CODE)
         session.closed = True
         self._session = None
+        self._service.absorb(session)
         session.frames.close("Sesión de cámara liberada.")
         self._record(LifecycleEvent.STOPPED, camera_id=session.camera_id, reason="recovery_failed")
         # El estado queda consistente antes de cualquier espera; luego se retira el vigilante
