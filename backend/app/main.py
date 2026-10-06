@@ -13,8 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
-from app.services.inference_engine import SimulatedInferenceEngine
-from app.services.inference_lifecycle import InferenceEngineLifecycle
+from app.services.inference_lifecycle import inference_lifecycle
 
 
 @asynccontextmanager
@@ -22,31 +21,36 @@ async def lifespan(app: FastAPI):
     """
     Ciclo de vida de la aplicación.
 
-    [SUPUESTO] El motor conectado aquí es `SimulatedInferenceEngine`
-    (E01/E02 no integran todavía un motor real — ver
+    Usa el singleton `inference_lifecycle` (mismo patrón que
+    `camera_session_manager`: importable a nivel de módulo, no un
+    objeto local oculto en `app.state`) para que cualquier consumidor
+    futuro pueda acceder a él con un simple import, sin depender de
+    recibir el objeto `app`/`Request`.
+
+    [SUPUESTO] El motor conectado es `SimulatedInferenceEngine` (E01/E02
+    no integran todavía un motor real — ver
     docs/E02_inference_lifecycle_contract.md, sección 5). Conectar un
     motor real es trabajo de una tarea posterior.
 
-    [SUPUESTO] Si `lifecycle.initialize()` falla, la excepción se deja
-    propagar: el arranque de la aplicación falla por completo (FastAPI
-    nunca llega a aceptar tráfico) en vez de iniciar en un modo
-    degradado. Es la opción más simple y seguridad por defecto; si el
-    equipo prefiere que la app arranque igual y solo el estado quede en
-    `ERROR` (modo degradado), es una decisión de producto a confirmar
-    con el líder técnico, no algo que este ticket decida unilateralmente.
+    [SUPUESTO] Si `inference_lifecycle.initialize()` falla, la excepción
+    se deja propagar: el arranque de la aplicación falla por completo
+    en vez de iniciar en modo degradado. Es una decisión de producto a
+    confirmar con el líder técnico, no algo que este ticket decida
+    unilateralmente.
 
     Si el líder técnico ya definió, en otra rama, un lifespan propio
     para base de datos y/o cámaras, ambos deben fusionarse aquí —
     FastAPI solo admite un lifespan por aplicación.
     """
-    lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
-    app.state.inference_lifecycle = lifecycle
-
-    await lifecycle.initialize()
+    await inference_lifecycle.initialize()
+    # Se mantiene también en app.state por conveniencia (p. ej. para un
+    # futuro endpoint de salud que necesite el objeto `app`/`Request`),
+    # pero el singleton importado es la vía principal de acceso.
+    app.state.inference_lifecycle = inference_lifecycle
     try:
         yield
     finally:
-        await lifecycle.shutdown()
+        await inference_lifecycle.shutdown()
 
 
 def create_app() -> FastAPI:

@@ -185,7 +185,8 @@ async def test_initialize_despues_de_closed_lanza_error():
 
 @pytest.mark.asyncio
 async def test_cancelacion_durante_initialize_transiciona_a_error():
-    lifecycle = InferenceEngineLifecycle(_SlowLoadEngine())
+    engine = _SlowLoadEngine()  # load() tarda 0.2s en un hilo real
+    lifecycle = InferenceEngineLifecycle(engine)
 
     task = asyncio.ensure_future(lifecycle.initialize())
     await asyncio.sleep(0.05)  # dejar que initialize() entre a run_in_executor
@@ -198,9 +199,19 @@ async def test_cancelacion_durante_initialize_transiciona_a_error():
     status = lifecycle.get_status()
     assert status.state == LifecycleState.ERROR
 
+    # Clave: el motor subyacente debe quedar REALMENTE sin recursos
+    # (UNLOADED) en este punto, no solo el wrapper reportando ERROR.
+    # Si initialize() hubiera cerrado el motor antes de que el hilo de
+    # fondo (todavía con ~0.15s por correr) terminara, ese hilo habría
+    # sobrescrito el estado a LOADED después del cierre — dejando el
+    # motor cargado aunque el ciclo de vida diga lo contrario. Esta
+    # aserción es la que detecta esa condición de carrera.
+    assert engine.get_status().state == EngineState.UNLOADED
+
     # Debe poder cerrarse sin problema después de una inicialización cancelada.
     await lifecycle.shutdown()
     assert lifecycle.get_status().state == LifecycleState.CLOSED
+    assert engine.get_status().state == EngineState.UNLOADED
 
 
 # ─────────────────────────────────────────────────────────────────────────

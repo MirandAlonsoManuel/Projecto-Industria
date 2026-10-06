@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from app.main import create_app
-from app.services.inference_lifecycle import LifecycleState
+from app.services.inference_lifecycle import LifecycleState, inference_lifecycle
 
 
 @pytest.mark.asyncio
@@ -18,10 +18,11 @@ async def test_lifespan_inicializa_y_cierra_el_motor_simulado():
     app = create_app()
 
     async with app.router.lifespan_context(app):
-        lifecycle = app.state.inference_lifecycle
-        status = lifecycle.get_status()
-        assert status.state == LifecycleState.AVAILABLE
-        assert status.loaded_at is not None
+        # Verificado por dos vías: el singleton importado directamente
+        # (la forma en que un futuro consumidor lo usaría, igual que
+        # camera_session_manager) y app.state (conveniencia).
+        assert inference_lifecycle.get_status().state == LifecycleState.AVAILABLE
+        assert app.state.inference_lifecycle is inference_lifecycle
 
     # Al salir del context manager, Starlette disparó el evento de cierre.
-    assert lifecycle.get_status().state == LifecycleState.CLOSED
+    assert inference_lifecycle.get_status().state == LifecycleState.CLOSED

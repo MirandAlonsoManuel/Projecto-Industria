@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from app.services.inference_engine import InferenceEngine
+from app.services.inference_engine import InferenceEngine, SimulatedInferenceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +105,23 @@ class InferenceEngineLifecycle:
             self._state = LifecycleState.LOADING
             self._last_error = None
 
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(None, self._engine.load)
+
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._engine.load)
+                await future
             except asyncio.CancelledError:
                 self._state = LifecycleState.ERROR
                 self._last_error = "La inicialización fue cancelada."
+                # El hilo del executor puede seguir corriendo aunque esta
+                # espera haya sido cancelada (limitación conocida: no se
+                # puede interrumpir código ya en ejecución dentro de un
+                # hilo). Si cerráramos el motor ahora mismo, load() podría
+                # terminar DESPUÉS y dejar el motor cargado otra vez,
+                # aunque el ciclo de vida ya reporte CLOSED. Por eso
+                # esperamos (protegidos de una nueva cancelación) a que
+                # el hilo realmente termine antes de limpiar.
+                await asyncio.shield(self._drain_future(future))
                 self._safe_close_engine()
                 raise
             except Exception as exc:
@@ -121,6 +132,24 @@ class InferenceEngineLifecycle:
 
             self._state = LifecycleState.AVAILABLE
             self._loaded_at = time.monotonic()
+
+    @staticmethod
+    async def _drain_future(future: "asyncio.Future") -> None:
+        """
+        Espera a que `future` termine (éxito o excepción) sin propagar
+        nada — solo nos interesa saber que el hilo de fondo ya no está
+        en vuelo antes de llamar a close().
+
+        Límite conocido: si llega una SEGUNDA cancelación mientras se
+        espera aquí (cancelación anidada durante la limpieza de una
+        cancelación previa), esta espera puede interrumpirse antes de
+        confirmar que el hilo terminó. Es un caso extremo no cubierto
+        explícitamente por este ticket — ver documentación.
+        """
+        try:
+            await future
+        except BaseException:
+            pass
 
     async def shutdown(self) -> None:
         """Libera el motor y transiciona a `CLOSED`. Idempotente."""
@@ -153,3 +182,17 @@ class InferenceEngineLifecycle:
             self._engine.close()
         except Exception as exc:  # pragma: no cover - defensivo
             logger.warning("Error cerrando el motor durante la limpieza: %s", exc)
+
+
+# Instancia global consumida por el lifespan de FastAPI (app/main.py) y por
+# cualquier futuro consumidor — mismo patrón que `camera_session_manager`
+# en `camera_session_manager.py`: un singleton importable a nivel de
+# módulo, no un objeto oculto dentro de `app.state`.
+#
+# [SUPUESTO] Al ser un singleton de proceso, solo soporta UN ciclo
+# initialize() → shutdown() por el tiempo de vida del proceso (CLOSED es
+# terminal — ver docstring de la clase). Esto refleja el comportamiento
+# real en producción (un proceso FastAPI = un ciclo de vida), pero es
+# una limitación a tener en cuenta en pruebas que disparen el lifespan
+# de la app más de una vez en el mismo proceso de pytest.
+inference_lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
