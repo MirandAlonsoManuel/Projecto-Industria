@@ -10,6 +10,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from app.core.config import get_settings
 from app.schemas.detection import Detection, DetectionResult, NormalizedBoundingBox
 
 
@@ -31,8 +32,11 @@ def _detection(**overrides) -> dict:
 
 
 def _result(**overrides) -> dict:
+    # Usa la cámara realmente configurada, en vez de un literal fijo,
+    # para que estas pruebas no dependan de adivinar el valor por
+    # defecto de Settings.camera_id.
     base = {
-        "camera_id": "0",
+        "camera_id": get_settings().camera_id,
         "timestamp": 1_700_000_000.0,
         "model_name": "yolo-industrial",
         "model_version": "1.2.0",
@@ -173,6 +177,31 @@ def test_timestamp_negativo_rechazado():
 def test_camera_id_vacio_rechazado():
     with pytest.raises(ValidationError):
         DetectionResult(**_result(camera_id=""))
+
+
+def test_camera_id_distinto_al_configurado_rechazado():
+    configured = get_settings().camera_id
+    otro_id = configured + "-otro"  # garantiza que sea distinto al configurado
+
+    with pytest.raises(ValidationError):
+        DetectionResult(**_result(camera_id=otro_id))
+
+
+def test_camera_id_igual_al_configurado_es_valido(monkeypatch):
+    monkeypatch.setenv("CAMERA_ID", "camara-de-prueba")
+    get_settings.cache_clear()
+
+    result = DetectionResult(**_result(camera_id="camara-de-prueba"))
+
+    assert result.camera_id == "camara-de-prueba"
+
+
+def test_camera_id_distinto_al_configurado_rechazado_con_override(monkeypatch):
+    monkeypatch.setenv("CAMERA_ID", "camara-de-prueba")
+    get_settings.cache_clear()
+
+    with pytest.raises(ValidationError):
+        DetectionResult(**_result(camera_id="otra-camara-cualquiera"))
 
 
 def test_campo_obligatorio_ausente_en_bbox_rechazado():

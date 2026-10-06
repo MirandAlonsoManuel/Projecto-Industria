@@ -20,11 +20,24 @@ backend que la produjo.
 Todos los modelos son inmutables (`frozen=True`) y no aceptan campos
 adicionales (`extra="forbid"`), para que la validación sea explícita y
 la serialización estable.
+
+[Corrección tras revisión técnica] `DetectionResult.camera_id` SÍ se
+valida contra `app.core.config.get_settings().camera_id` — la única
+cámara configurada para el alcance vigente del proyecto. La primera
+versión de este módulo no hacía esta validación (se interpretó la nota
+del contrato como alcance informativo); la revisión confirmó que el
+contrato de Jira exige rechazar explícitamente cualquier otro valor.
+Esto acopla este módulo a `app.core.config`, pero no al módulo de
+cámara en sí (`camera_service.py`, `CameraCapture`, etc.) — se lee
+únicamente un valor de configuración ya centralizado y usado en todo
+el proyecto, lo mismo que hacen `inference.py` o `stream.py`.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.core.config import get_settings
 
 
 class NormalizedBoundingBox(BaseModel):
@@ -101,11 +114,10 @@ class DetectionResult(BaseModel):
         ...,
         min_length=1,
         description=(
-            "Identificador de la cámara origen del frame. Para el alcance "
-            "vigente del proyecto corresponde a la única cámara configurada "
-            "— este modelo no valida ese match contra la configuración de "
-            "la app (ver nota de diseño en la documentación de E05); solo "
-            "exige que no esté vacío."
+            "Identificador de la cámara origen del frame. Debe coincidir "
+            "exactamente con la única cámara configurada "
+            "(app.core.config.Settings.camera_id) para el alcance vigente "
+            "del proyecto; cualquier otro valor se rechaza."
         ),
     )
     timestamp: float = Field(
@@ -126,3 +138,13 @@ class DetectionResult(BaseModel):
         default_factory=list,
         description="Detecciones encontradas; lista vacía si no se detectó nada (resultado igualmente válido).",
     )
+
+    @model_validator(mode="after")
+    def _check_camera_id_matches_configured(self) -> "DetectionResult":
+        configured = get_settings().camera_id
+        if self.camera_id != configured:
+            raise ValueError(
+                f"camera_id '{self.camera_id}' no coincide con la única "
+                f"cámara configurada ('{configured}')."
+            )
+        return self
