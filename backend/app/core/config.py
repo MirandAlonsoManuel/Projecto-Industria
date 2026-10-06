@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     ws_max_queue_size: int = 5
     max_cameras: int = 4
 
+    # Identificador de la única cámara configurada para el alcance
+    # vigente del proyecto (ver E05: DetectionResult.camera_id debe
+    # coincidir con este valor).
+    camera_id: str = "0"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

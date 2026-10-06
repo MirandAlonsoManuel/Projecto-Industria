@@ -22,3 +22,11 @@ FRAME_STALE_TIMEOUT_S: float = 5.0   # segundos sin frames antes de considerar s
 
 # ── Rendimiento ───────────────────────────────────────────────────────────────
 TARGET_FPS: int = 30              # FPS objetivo del loop de captura
+
+# ── Ciclo de vida ─────────────────────────────────────────────────────────────
+LIFECYCLE_EVENT_HISTORY: int = 50 # eventos del ciclo de vida conservados (circular)
+
+# ── Vigilancia y recuperación de cámara estancada (M10) ───────────────────────
+WATCHDOG_INTERVAL_S: float = 0.5  # cada cuánto revisa el vigilante la actividad
+RECOVERY_MAX_ATTEMPTS: int = 3    # reaperturas por recuperación, y recuperaciones seguidas sin frames
+RECOVERY_BACKOFF_S: float = 0.5   # espera antes del 1er intento; se duplica en cada uno

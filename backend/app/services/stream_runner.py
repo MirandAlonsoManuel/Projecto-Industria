@@ -12,6 +12,11 @@ Aquí solo se consume ese slot con tareas independientes:
 
 Cuando cualquiera termina, las demás se cancelan y se esperan antes de liberar
 la sesión, de modo que la cámara se libera sin tareas pendientes.
+
+Ciclo de vida (M07): cada cliente consume el slot que recibió al conectarse.
+Si un operador detiene la sesión, lo desconecta o el servicio se apaga, ese
+slot se cierra con el código de la causa y aquí se traduce en el mensaje y el
+código de cierre que recibe el cliente (ver CLOSE_CODES).
 """
 
 from __future__ import annotations
@@ -27,18 +32,37 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core.config import get_settings
 from app.services.camera_session_manager import (
-    NO_FRAMES_CODE,
     CameraSession,
     CameraSessionManager,
-    SessionBusyError,
-    SessionCameraError,
+    SessionError,
 )
-from app.services.frame_slot import FrameSlotClosed
+from app.services.frame_slot import FrameSlot, FrameSlotClosed
+from app.services.redaction import redact_source, redact_text
 from app.services.stream_protocol import encode_ws_message
 
 InferFn = Callable[[np.ndarray], list]
 
 STREAM_ERROR_CODE = "STREAM_ERROR"
+
+# Código de cierre WebSocket para cada causa de rechazo o de fin de sesión
+CLOSE_CODES: dict[str, int] = {
+    "CAMERA_BUSY": 1008,             # política: ya hay un cliente activo
+    "CAMERA_MISMATCH": 1008,         # política: la sesión usa otra cámara
+    "CAMERA_UNAVAILABLE": 1000,
+    "CAMERA_NO_FRAMES": 1000,
+    "STREAM_CLOSED": 1000,
+    "SESSION_STOPPED": 1000,         # un operador detuvo la sesión
+    "CLIENT_DISCONNECTED": 1000,     # un operador desconectó al cliente
+    "SERVICE_SHUTTING_DOWN": 1001,   # el servidor se está apagando
+    "SERVICE_SHUTDOWN": 1001,
+    "CAMERA_READ_ERROR": 1011,
+    "CAMERA_STALLED": 1011,          # la cámara se estancó y no se pudo recuperar
+    STREAM_ERROR_CODE: 1011,
+}
+
+_BUSY_DESCRIPTION = (
+    "La cámara ya está en uso por otro cliente. Intente de nuevo cuando se libere."
+)
 
 
 @dataclass
@@ -65,6 +89,7 @@ async def _notify_and_close(
 async def _send_loop(
     websocket: WebSocket,
     session: CameraSession,
+    slot: FrameSlot,
     camera_id: str,
     jpeg_quality: int,
     detections: _Detections,
@@ -72,7 +97,7 @@ async def _send_loop(
     loop = asyncio.get_running_loop()
     last_seq = 0
     while True:
-        packet = await session.frames.next(last_seq)
+        packet = await slot.next(last_seq)
         if last_seq:
             session.delivery.frames_skipped += packet.seq - last_seq - 1
         last_seq = packet.seq
@@ -100,7 +125,7 @@ async def _receive_loop(websocket: WebSocket) -> None:
 
 
 async def _inference_loop(
-    session: CameraSession,
+    slot: FrameSlot,
     infer: InferFn,
     every_n_frames: int,
     detections: _Detections,
@@ -111,7 +136,7 @@ async def _inference_loop(
         # Primer frame disponible y luego uno cada N; si la inferencia tardó
         # más que eso, se toma directamente el más reciente.
         after = last_seq + every_n_frames - 1 if last_seq else 0
-        packet = await session.frames.next(after)
+        packet = await slot.next(after)
         detections.items = await loop.run_in_executor(None, infer, packet.frame)
         last_seq = packet.seq
 
@@ -119,6 +144,7 @@ async def _inference_loop(
 async def _run_tasks(
     websocket: WebSocket,
     session: CameraSession,
+    slot: FrameSlot,
     camera_id: str,
     infer: Optional[InferFn],
     infer_every_n_frames: int,
@@ -130,13 +156,13 @@ async def _run_tasks(
     tasks = [
         receiver,
         asyncio.create_task(
-            _send_loop(websocket, session, camera_id, settings.jpeg_quality, detections)
+            _send_loop(websocket, session, slot, camera_id, settings.jpeg_quality, detections)
         ),
     ]
     if infer is not None:
         tasks.append(
             asyncio.create_task(
-                _inference_loop(session, infer, infer_every_n_frames, detections)
+                _inference_loop(slot, infer, infer_every_n_frames, detections)
             )
         )
 
@@ -157,11 +183,15 @@ async def _run_tasks(
     if error is None or isinstance(error, WebSocketDisconnect):
         return
     if isinstance(error, FrameSlotClosed):
-        close_code = 1000 if error.code == NO_FRAMES_CODE else 1011
-        await _notify_and_close(websocket, camera_id, error.code, str(error), close_code)
+        close_code = CLOSE_CODES.get(error.code, 1011)
+        await _notify_and_close(
+            websocket, camera_id, error.code, redact_text(str(error)), close_code
+        )
         return
     session.record_error(str(error))
-    await _notify_and_close(websocket, camera_id, STREAM_ERROR_CODE, str(error), 1011)
+    await _notify_and_close(
+        websocket, camera_id, STREAM_ERROR_CODE, redact_text(str(error)), 1011
+    )
 
 
 async def serve_camera_stream(
@@ -175,40 +205,51 @@ async def serve_camera_stream(
     """
     Atiende un cliente WebSocket de principio a fin.
 
+    Si no hay sesión iniciada, la conexión la inicia y al desconectarse la
+    cierra. Si un operador la inició antes, la cámara sigue abierta al salir.
+
     Códigos de cierre:
-    - 1000 — cierre normal (sin cámara, cámara sin frames o cliente desconectado).
-    - 1008 — sesión ocupada: ya hay un cliente activo.
-    - 1011 — error interno del servidor.
+    - 1000 — cierre normal: cliente desconectado, sesión detenida o expulsión
+             por operador, sin cámara o cámara sin frames.
+    - 1001 — el servicio se está apagando.
+    - 1008 — rechazo por política: cámara ocupada o cámara distinta a la de la sesión.
+    - 1011 — error interno, de lectura o de procesamiento.
     """
     await websocket.accept()
     client_id = str(uuid.uuid4())
 
+    # La cámara se abre con la fuente real; al cliente solo le llega la versión
+    # sin credenciales (M12).
+    public_id = redact_source(camera_id)
+
     try:
         session = await manager.acquire(camera_id, client_id)
-    except SessionBusyError as exc:
+    except SessionError as exc:
+        description = (
+            _BUSY_DESCRIPTION if exc.code == "CAMERA_BUSY" else redact_text(str(exc), camera_id)
+        )
         await _notify_and_close(
-            websocket,
-            camera_id,
-            exc.code,
-            "La cámara ya está en uso por otro cliente. "
-            "Intente de nuevo cuando se libere.",
-            1008,
+            websocket, public_id, exc.code, description, CLOSE_CODES.get(exc.code, 1011)
         )
         return
-    except SessionCameraError as exc:
-        await _notify_and_close(websocket, camera_id, exc.code, str(exc), 1000)
-        return
+
+    # El slot de esta conexión: si la sesión sigue después de que este cliente
+    # se vaya, el siguiente cliente recibirá uno nuevo.
+    slot = session.frames
 
     try:
         await websocket.send_json(
             {
                 "connected": True,
-                "camera_id": camera_id,
+                "camera_id": public_id,
+                "client_id": client_id,
+                "state": manager.state.value,
+                "started_by": session.started_by.value,
                 "error": None,
                 "description": ready_description,
             }
         )
-        await _run_tasks(websocket, session, camera_id, infer, infer_every_n_frames)
+        await _run_tasks(websocket, session, slot, public_id, infer, infer_every_n_frames)
     except WebSocketDisconnect:
         pass
     finally:
