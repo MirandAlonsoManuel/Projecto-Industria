@@ -5,12 +5,36 @@ Inicializa la instancia de FastAPI con la configuración del proyecto
 y registra todos los routers disponibles.
 """
 
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
+from app.services.camera_session_manager import camera_session_manager
+
+# Logger de uvicorn: sus mensajes aparecen en la consola del servidor
+logger = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Ciclo de vida del proceso.
+
+    Al apagarse el servidor se ejecuta el apagado global de la cámara: se
+    libera la sesión si existe y se dejan de aceptar sesiones nuevas. La
+    operación es idempotente, así que es seguro aunque la sesión ya esté cerrada.
+    """
+    yield
+    released = await camera_session_manager.shutdown()
+    logger.info(
+        "Apagado global de cámara: %s",
+        "sesión liberada" if released else "no había sesión activa",
+    )
 
 
 def create_app() -> FastAPI:
@@ -29,6 +53,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.version_api,
+        lifespan=lifespan,
     )
 
     app.add_middleware(
