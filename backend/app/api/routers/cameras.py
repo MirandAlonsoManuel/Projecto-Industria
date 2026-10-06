@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 
 from app.services.camera_service import detect_available_cameras
 from app.services.camera_session_manager import SessionError, camera_session_manager
+from app.services.redaction import redact_source
 
 router = APIRouter(tags=["cameras"])
 
@@ -100,6 +101,22 @@ def session_status() -> JSONResponse:
     )
 
 
+@router.get(
+    "/cameras/metrics",
+    summary="Métricas operativas de la cámara y el streaming",
+    description=(
+        "Reúne en una sola consulta el estado de la cámara, el único cliente "
+        "(`connected` vale 0 o 1), los frames capturados, perdidos, enviados y "
+        "saltados, las recuperaciones, los errores y el último error. Cada "
+        "contador se reporta para la sesión actual (`session`) y acumulado "
+        "desde que arrancó el servicio (`since_start`). Ningún campo contiene "
+        "credenciales: las fuentes RTSP se muestran enmascaradas."
+    ),
+)
+def camera_metrics() -> JSONResponse:
+    return _ok(camera_session_manager.get_metrics(), "Métricas operativas de la cámara.")
+
+
 @router.post(
     "/cameras/session/start",
     summary="Iniciar la sesión de cámara",
@@ -124,7 +141,7 @@ async def start_session(
         return _session_error(exc)
     return _ok(
         camera_session_manager.get_lifecycle_status(),
-        f"Sesión iniciada con la cámara '{camera_id}'.",
+        f"Sesión iniciada con la cámara '{redact_source(camera_id)}'.",
         status_code=status.HTTP_201_CREATED,
     )
 
