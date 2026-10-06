@@ -19,6 +19,7 @@ real es trabajo de una tarea posterior.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass
@@ -81,6 +82,13 @@ class InferenceEngineLifecycle:
         self._loaded_at: Optional[float] = None
         self._last_error: Optional[str] = None
         self._lock = asyncio.Lock()
+        # Executor propio (no el compartido por defecto de asyncio): lo
+        # necesitamos para quedarnos con el Future CRUDO de
+        # concurrent.futures al llamar engine.load(). Es clave para la
+        # corrección de la sección "drenaje tras cancelación" más abajo
+        # — ver ese comentario para el porqué. max_workers=1 porque el
+        # lock ya garantiza que nunca hay más de un load() en vuelo.
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     async def initialize(self) -> None:
         """
@@ -106,22 +114,31 @@ class InferenceEngineLifecycle:
             self._last_error = None
 
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(None, self._engine.load)
+            # IMPORTANTE: usamos self._executor.submit() directamente (no
+            # loop.run_in_executor) para quedarnos con el Future CRUDO de
+            # concurrent.futures. loop.run_in_executor() solo devuelve un
+            # Future de asyncio que ENVUELVE a este — y ese envoltorio,
+            # al cancelarse, queda resuelto/"cancelado" de inmediato del
+            # lado de asyncio, SIN DETENER el hilo real que sigue
+            # corriendo. Volver a hacer `await` sobre ese mismo
+            # envoltorio ya cancelado retorna casi instantáneamente, sin
+            # esperar nada de verdad — ese fue el bug de la corrección
+            # anterior. El Future crudo, en cambio, sí refleja cuándo el
+            # hilo real termina, sin importar qué le pasó al envoltorio.
+            raw_future = self._executor.submit(self._engine.load)
+            wrapped = asyncio.wrap_future(raw_future, loop=loop)
 
             try:
-                await future
+                await wrapped
             except asyncio.CancelledError:
                 self._state = LifecycleState.ERROR
                 self._last_error = "La inicialización fue cancelada."
-                # El hilo del executor puede seguir corriendo aunque esta
-                # espera haya sido cancelada (limitación conocida: no se
-                # puede interrumpir código ya en ejecución dentro de un
-                # hilo). Si cerráramos el motor ahora mismo, load() podría
-                # terminar DESPUÉS y dejar el motor cargado otra vez,
-                # aunque el ciclo de vida ya reporte CLOSED. Por eso
-                # esperamos (protegidos de una nueva cancelación) a que
-                # el hilo realmente termine antes de limpiar.
-                await asyncio.shield(self._drain_future(future))
+                # Esperamos (protegidos de una nueva cancelación) a que
+                # el hilo real termine de verdad antes de limpiar — con
+                # un envoltorio NUEVO sobre el mismo Future crudo, que
+                # todavía no está cancelado y sí espera la finalización
+                # real.
+                await asyncio.shield(self._drain_raw_future(raw_future, loop))
                 self._safe_close_engine()
                 raise
             except Exception as exc:
@@ -134,11 +151,13 @@ class InferenceEngineLifecycle:
             self._loaded_at = time.monotonic()
 
     @staticmethod
-    async def _drain_future(future: "asyncio.Future") -> None:
+    async def _drain_raw_future(
+        raw_future: "concurrent.futures.Future", loop: asyncio.AbstractEventLoop
+    ) -> None:
         """
-        Espera a que `future` termine (éxito o excepción) sin propagar
-        nada — solo nos interesa saber que el hilo de fondo ya no está
-        en vuelo antes de llamar a close().
+        Espera a que el hilo real (`raw_future`) termine de verdad —
+        éxito o excepción — sin propagar nada; solo nos interesa saber
+        que ya no está en vuelo antes de llamar a close().
 
         Límite conocido: si llega una SEGUNDA cancelación mientras se
         espera aquí (cancelación anidada durante la limpieza de una
@@ -147,7 +166,7 @@ class InferenceEngineLifecycle:
         explícitamente por este ticket — ver documentación.
         """
         try:
-            await future
+            await asyncio.wrap_future(raw_future, loop=loop)
         except BaseException:
             pass
 
@@ -159,6 +178,10 @@ class InferenceEngineLifecycle:
             self._safe_close_engine()
             self._state = LifecycleState.CLOSED
             self._loaded_at = None
+            # wait=False: para cuando shutdown() se alcanza, ya se
+            # esperó (o nunca hubo) un load() en vuelo — no debería
+            # haber trabajo pendiente que bloquee el cierre.
+            self._executor.shutdown(wait=False)
 
     def get_status(self) -> LifecycleStatus:
         """Retorna el estado actual, sin efectos secundarios."""

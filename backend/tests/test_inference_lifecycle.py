@@ -199,13 +199,23 @@ async def test_cancelacion_durante_initialize_transiciona_a_error():
     status = lifecycle.get_status()
     assert status.state == LifecycleState.ERROR
 
-    # Clave: el motor subyacente debe quedar REALMENTE sin recursos
-    # (UNLOADED) en este punto, no solo el wrapper reportando ERROR.
-    # Si initialize() hubiera cerrado el motor antes de que el hilo de
-    # fondo (todavía con ~0.15s por correr) terminara, ese hilo habría
-    # sobrescrito el estado a LOADED después del cierre — dejando el
-    # motor cargado aunque el ciclo de vida diga lo contrario. Esta
-    # aserción es la que detecta esa condición de carrera.
+    # Primera verificación: el motor subyacente debe quedar sin recursos
+    # (UNLOADED) justo después de que `await task` retorna. Esto por sí
+    # solo NO es suficiente para detectar la condición de carrera real:
+    # una versión con el bug también pasaría esta aserción, porque en
+    # ese momento el hilo de fondo (con ~0.15s por correr) todavía no ha
+    # tenido tiempo de sobrescribir el estado. Por eso sigue la segunda
+    # verificación, más abajo, que es la que de verdad importa.
+    assert engine.get_status().state == EngineState.UNLOADED
+
+    # Segunda verificación — ESTA es la que detecta el bug real: se
+    # espera MÁS tiempo del que tarda `_SlowLoadEngine.load()` (0.2s) y
+    # se confirma que el motor SIGUE sin recursos. Con el bug original,
+    # el hilo de fondo terminaba después de este punto y sobrescribía el
+    # estado a LOADED — esta aserción habría fallado con la versión
+    # anterior de la corrección, que solo verificaba inmediatamente
+    # después de cancelar.
+    await asyncio.sleep(0.3)
     assert engine.get_status().state == EngineState.UNLOADED
 
     # Debe poder cerrarse sin problema después de una inicialización cancelada.

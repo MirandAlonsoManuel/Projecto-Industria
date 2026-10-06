@@ -5,6 +5,7 @@ Inicializa la instancia de FastAPI con la configuración del proyecto
 y registra todos los routers disponibles.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,19 +14,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
+from app.services.camera_session_manager import camera_session_manager
 from app.services.inference_lifecycle import inference_lifecycle
+
+# Logger de uvicorn: sus mensajes aparecen en la consola del servidor
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Ciclo de vida de la aplicación.
+    Ciclo de vida del proceso.
 
-    Usa el singleton `inference_lifecycle` (mismo patrón que
-    `camera_session_manager`: importable a nivel de módulo, no un
-    objeto local oculto en `app.state`) para que cualquier consumidor
-    futuro pueda acceder a él con un simple import, sin depender de
-    recibir el objeto `app`/`Request`.
+    Arranque: inicializa el motor de inferencia (E02 — ver
+    `inference_lifecycle.py`). Usa el singleton `inference_lifecycle`
+    (mismo patrón que `camera_session_manager`: importable a nivel de
+    módulo, no un objeto local oculto en `app.state`) para que cualquier
+    consumidor futuro pueda acceder a él con un simple import.
+
+    Apagado: cierra el motor de inferencia y realiza el apagado global
+    de cámara (`camera_session_manager`). Cada cierre está protegido por
+    separado para que un fallo en uno no impida que el otro se ejecute
+    — ninguno de los dos debe dejar recursos a medio liberar por culpa
+    del otro.
 
     [SUPUESTO] El motor conectado es `SimulatedInferenceEngine` (E01/E02
     no integran todavía un motor real — ver
@@ -36,21 +47,31 @@ async def lifespan(app: FastAPI):
     se deja propagar: el arranque de la aplicación falla por completo
     en vez de iniciar en modo degradado. Es una decisión de producto a
     confirmar con el líder técnico, no algo que este ticket decida
-    unilateralmente.
-
-    Si el líder técnico ya definió, en otra rama, un lifespan propio
-    para base de datos y/o cámaras, ambos deben fusionarse aquí —
-    FastAPI solo admite un lifespan por aplicación.
+    unilateralmente. (El apagado de cámara no tiene un paso de arranque
+    propio, así que esta decisión no lo afecta.)
     """
     await inference_lifecycle.initialize()
     # Se mantiene también en app.state por conveniencia (p. ej. para un
     # futuro endpoint de salud que necesite el objeto `app`/`Request`),
     # pero el singleton importado es la vía principal de acceso.
     app.state.inference_lifecycle = inference_lifecycle
+
     try:
         yield
     finally:
-        await inference_lifecycle.shutdown()
+        try:
+            await inference_lifecycle.shutdown()
+        except Exception:
+            logger.exception("Error cerrando el ciclo de vida de inferencia.")
+
+        try:
+            released = await camera_session_manager.shutdown()
+            logger.info(
+                "Apagado global de cámara: %s",
+                "sesión liberada" if released else "no había sesión activa",
+            )
+        except Exception:
+            logger.exception("Error en el apagado global de cámara.")
 
 
 def create_app() -> FastAPI:
