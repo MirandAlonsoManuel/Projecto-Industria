@@ -169,13 +169,42 @@ async def test_cierre_despues_de_error_transiciona_a_closed():
 
 
 @pytest.mark.asyncio
-async def test_initialize_despues_de_closed_lanza_error():
+async def test_initialize_despues_de_closed_reinicia_correctamente():
+    """
+    CLOSED no es terminal: initialize() después de shutdown() debe
+    volver a cargar con éxito, no lanzar error.
+    """
     lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
     await lifecycle.initialize()
     await lifecycle.shutdown()
+    assert lifecycle.get_status().state == LifecycleState.CLOSED
 
-    with pytest.raises(RuntimeError):
+    await lifecycle.initialize()
+
+    assert lifecycle.get_status().state == LifecycleState.AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_ciclos_consecutivos_de_arranque_y_apagado_en_la_misma_instancia():
+    """
+    Prueba de regresión: reproduce exactamente el escenario reportado en
+    revisión ("inicios y cierres consecutivos de la aplicación") sobre
+    la MISMA instancia — relevante porque `inference_lifecycle` es un
+    singleton de proceso (ver main.py), y varias pruebas de integración
+    que levanten y apaguen la app comparten ese mismo objeto.
+    """
+    lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
+
+    for ciclo in range(4):
         await lifecycle.initialize()
+        assert lifecycle.get_status().state == LifecycleState.AVAILABLE, (
+            f"Falló en el ciclo {ciclo}"
+        )
+
+        await lifecycle.shutdown()
+        assert lifecycle.get_status().state == LifecycleState.CLOSED, (
+            f"Falló en el ciclo {ciclo}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────

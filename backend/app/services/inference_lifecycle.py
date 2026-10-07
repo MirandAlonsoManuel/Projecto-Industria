@@ -37,7 +37,9 @@ class LifecycleState(str, Enum):
     con `EngineState` de E01, que describe solo al motor (unloaded /
     loaded / error). Este estado agrega las dos fases que la aplicación
     necesita y que el motor no expone: una transitoria de carga
-    (`LOADING`) y una terminal de apagado (`CLOSED`).
+    (`LOADING`) y una de apagado (`CLOSED`). `CLOSED` NO es terminal:
+    `initialize()` puede volver a llamarse después, p. ej. ante ciclos
+    de arranque/apagado consecutivos del mismo proceso.
     """
 
     NOT_INITIALIZED = "not_initialized"
@@ -66,9 +68,10 @@ class InferenceEngineLifecycle:
         repetidamente o de forma concurrente (protegido por un lock).
       - `initialize()` llamado en estado `ERROR` reintenta la carga
         (permite recuperación manual sin recrear la instancia).
-      - `initialize()` llamado en estado `CLOSED` lanza `RuntimeError`:
-        un ciclo de vida cerrado no se reabre a sí mismo — para volver a
-        operar se crea una nueva instancia (ver pruebas de "reinicio").
+      - `initialize()` llamado en estado `CLOSED` también reintenta la
+        carga — `CLOSED` no es terminal; soporta ciclos consecutivos de
+        `initialize()` → `shutdown()` → `initialize()` sobre la MISMA
+        instancia (relevante para un singleton de proceso, ver abajo).
       - `shutdown()` es idempotente: llamarlo más de una vez, o sin
         haber inicializado nunca, no falla.
       - `shutdown()` libera el motor sin importar si se llega a él desde
@@ -88,7 +91,11 @@ class InferenceEngineLifecycle:
         # corrección de la sección "drenaje tras cancelación" más abajo
         # — ver ese comentario para el porqué. max_workers=1 porque el
         # lock ya garantiza que nunca hay más de un load() en vuelo.
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._executor = self._new_executor()
+
+    @staticmethod
+    def _new_executor() -> concurrent.futures.ThreadPoolExecutor:
+        return concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     async def initialize(self) -> None:
         """
@@ -96,7 +103,6 @@ class InferenceEngineLifecycle:
         de la clase.
 
         Raises:
-            RuntimeError: si el ciclo de vida ya está `CLOSED`.
             Exception: la excepción original de `engine.load()` (p. ej.
                 `EngineLoadError`) si la carga falla.
         """
@@ -105,10 +111,11 @@ class InferenceEngineLifecycle:
                 return  # ya cargado: no-op, garantiza carga única
 
             if self._state is LifecycleState.CLOSED:
-                raise RuntimeError(
-                    "No se puede inicializar un ciclo de vida ya cerrado; "
-                    "cree una nueva instancia de InferenceEngineLifecycle."
-                )
+                # CLOSED no es terminal: el executor anterior quedó
+                # inservible tras shutdown() (un ThreadPoolExecutor no
+                # se puede reutilizar luego de shutdown()), así que se
+                # recrea antes de reintentar la carga.
+                self._executor = self._new_executor()
 
             self._state = LifecycleState.LOADING
             self._last_error = None
@@ -212,10 +219,9 @@ class InferenceEngineLifecycle:
 # en `camera_session_manager.py`: un singleton importable a nivel de
 # módulo, no un objeto oculto dentro de `app.state`.
 #
-# [SUPUESTO] Al ser un singleton de proceso, solo soporta UN ciclo
-# initialize() → shutdown() por el tiempo de vida del proceso (CLOSED es
-# terminal — ver docstring de la clase). Esto refleja el comportamiento
-# real en producción (un proceso FastAPI = un ciclo de vida), pero es
-# una limitación a tener en cuenta en pruebas que disparen el lifespan
-# de la app más de una vez en el mismo proceso de pytest.
+# Soporta múltiples ciclos initialize() → shutdown() sobre la misma
+# instancia (CLOSED no es terminal — ver docstring de la clase), lo cual
+# es necesario precisamente porque es un singleton de proceso: distintas
+# pruebas de integración que levanten y apaguen la app más de una vez en
+# el mismo proceso de pytest reutilizan este mismo objeto.
 inference_lifecycle = InferenceEngineLifecycle(SimulatedInferenceEngine())
