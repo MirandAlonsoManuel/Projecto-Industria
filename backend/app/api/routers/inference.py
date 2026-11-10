@@ -12,6 +12,7 @@ from app.schemas.inference import (
 from app.services.camera_session_manager import camera_session_manager
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
 from app.services.inference_service import InferenceError, inference_service
+from app.services.detections import normalize_detections
 from app.services.model_registry import ModelRegistryError
 from app.services.stream_runner import serve_camera_stream
 
@@ -173,7 +174,9 @@ async def inference_stream(
         # La captura entrega el frame completo; el ROI se aplica solo aquí.
         cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
         _, detections = inference_service.localize(cropped, model_id, conf, iou, offset)
-        return detections
+        # Coordenadas absolutas del frame original, recortadas a sus límites.
+        height, width = frame.shape[:2]
+        return normalize_detections(detections, width, height)
 
     await serve_camera_stream(
         websocket,

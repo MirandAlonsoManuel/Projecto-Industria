@@ -74,7 +74,14 @@ class FakeInference:
         self.calls += 1
         if self.fail:
             raise RuntimeError("modelo no disponible")
-        return "fake-model", [{"label": "pieza", "confidence": 0.9}]
+        return "fake-model", [
+            {
+                "class_id": 0,
+                "class_name": "pieza",
+                "confidence": 0.9,
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 5.0, "y2": 5.0},
+            }
+        ]
 
 
 @pytest.fixture
@@ -246,7 +253,16 @@ def test_inference_stream_entrega_detecciones(client, fake_inference):
                 break
 
     assert bienvenida["state"] == "streaming"
-    assert metadatos["detections"] == [{"label": "pieza", "confidence": 0.9}]
+    assert metadatos["detections"] == [
+        {
+            "class_id": 0,
+            "class_name": "pieza",
+            "confidence": 0.9,
+            "bbox": {"x1": 1.0, "y1": 1.0, "x2": 5.0, "y2": 5.0},
+        }
+    ]
+    # Cada mensaje declara el tamaño del frame original (aquí, 8x8)
+    assert metadatos["frame_width"] == 8 and metadatos["frame_height"] == 8
     assert fake_inference.calls >= 1
 
 

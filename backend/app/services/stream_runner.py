@@ -102,6 +102,8 @@ async def _send_loop(
             session.delivery.frames_skipped += packet.seq - last_seq - 1
         last_seq = packet.seq
 
+        # Tamaño del frame ORIGINAL: las cajas se entregan en sus coordenadas.
+        height, width = packet.frame.shape[:2]
         message = await loop.run_in_executor(
             None,
             encode_ws_message,
@@ -112,6 +114,7 @@ async def _send_loop(
             jpeg_quality,
             packet.seq,
             packet.captured_at,
+            {"frame_width": width, "frame_height": height},
         )
         await websocket.send_bytes(message)
         session.delivery.frames_sent += 1
