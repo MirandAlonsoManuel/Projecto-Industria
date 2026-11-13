@@ -125,18 +125,17 @@ async def wait_until(predicate, timeout: float = 5.0) -> None:
 class Stream:
     """Un cliente conectado a serve_camera_stream.
 
-    `control` y `timeout` solo se pasan si se indican, para que la misma ayuda
-    sirva en cada etapa del stream (con o sin update_roi, con o sin timeout).
+    `timeout` es holgado por defecto para que las pruebas no dependan de la
+    velocidad de la máquina; la prueba del plazo de producción lo indica
+    explícitamente. `control` solo se pasa si se indica.
     """
 
-    def __init__(self, manager, infer=None, every_n=1, timeout=None, control=None, camera_id="0"):
+    def __init__(self, manager, infer=None, every_n=1, timeout=2.0, control=None, camera_id="0"):
         self.ws = FakeWebSocket()
         self.control = control
-        options = {}
+        options = {"inference_timeout_s": timeout}
         if control is not None:
             options["control"] = control
-        if timeout is not None:
-            options["inference_timeout_s"] = timeout
         self.task = asyncio.create_task(
             serve_camera_stream(
                 self.ws,

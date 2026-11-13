@@ -14,7 +14,8 @@ from app.services.image_service import ImageInputError, decode_image, resolve_ro
 from app.services.inference_service import InferenceError, inference_service
 from app.services.detections import normalize_detections
 from app.services.model_registry import ModelRegistryError
-from app.services.stream_runner import serve_camera_stream
+from app.services.stream_control import RoiOutOfFrame, StreamControl
+from app.services.stream_runner import INFERENCE_TIMEOUT_S, serve_camera_stream
 
 router = APIRouter(tags=["inference"])
 
@@ -164,18 +165,32 @@ async def inference_stream(
     conf: float = Query(default=0.25, ge=0.0, le=1.0),
     iou: float = Query(default=0.45, ge=0.0, le=1.0),
     infer_every_n_frames: int = Query(default=3, ge=1, le=120),
+    inference_timeout_s: float = Query(default=INFERENCE_TIMEOUT_S, gt=0, le=5.0),
     roi: str | None = Query(default=None),
     x1: int | None = Query(default=None),
     y1: int | None = Query(default=None),
     x2: int | None = Query(default=None),
     y2: int | None = Query(default=None),
 ) -> None:
-    def infer(frame) -> list[dict]:
-        # La captura entrega el frame completo; el ROI se aplica solo aquí.
-        cropped, _, offset = _roi_query(frame, roi, x1, y1, x2, y2)
+    # Estado de control de ESTA conexión (ROI activa, update_roi). La ROI de la
+    # URL es solo la inicial; si es inválida no se cierra el socket (ver
+    # StreamControl.set_initial_roi).
+    control = StreamControl()
+    control.set_initial_roi(roi, x1, y1, x2, y2)
+
+    def infer(frame, active_roi) -> list[dict]:
+        # La captura entrega el frame completo; la ROI se aplica solo aquí.
+        height, width = frame.shape[:2]
+        if active_roi is None:
+            cropped, offset = frame, (0, 0)
+        else:
+            ax1, ay1, ax2, ay2 = active_roi
+            try:
+                cropped, _, offset = resolve_roi_request(frame, None, ax1, ay1, ax2, ay2)
+            except ImageInputError as exc:
+                raise RoiOutOfFrame(str(exc)) from exc
         _, detections = inference_service.localize(cropped, model_id, conf, iou, offset)
         # Coordenadas absolutas del frame original, recortadas a sus límites.
-        height, width = frame.shape[:2]
         return normalize_detections(detections, width, height)
 
     await serve_camera_stream(
@@ -185,4 +200,6 @@ async def inference_stream(
         "Cámara detectada. Iniciando inferencia.",
         infer=infer,
         infer_every_n_frames=infer_every_n_frames,
+        inference_timeout_s=inference_timeout_s,
+        control=control,
     )

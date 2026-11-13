@@ -92,6 +92,14 @@ def test_boxes_are_clamped_to_the_original_frame_and_message_carries_its_size(cl
     assert meta["detections"][0]["bbox"] == {"x1": 0.0, "y1": 0.0, "x2": float(WIDTH), "y2": float(HEIGHT)}
 
 
+def test_each_message_pairs_detections_with_the_same_frame_metadata(client):
+    with client.websocket_connect("/ws/inference-stream?infer_every_n_frames=1") as ws:
+        ws.receive_json()
+        meta = _receive_until(ws, lambda kind, p: kind == "frame" and p["detections_status"] == "ok")
+    assert meta["seq"] >= 1 and meta["captured_at"] == meta["timestamp"]
+    assert meta["detections"]
+
+
 def test_roi_box_is_translated_to_the_original_frame_by_the_endpoint(client):
     # La ROI llega por la URL (formato x,y,ancho,alto); localize recibe el recorte y el offset.
     with client.websocket_connect("/ws/inference-stream?roi=4,6,36,24&infer_every_n_frames=1") as ws:
@@ -100,3 +108,30 @@ def test_roi_box_is_translated_to_the_original_frame_by_the_endpoint(client):
     assert ((24, 36), (4, 6)) in client.localize_calls
     # La caja falsa se sale del frame, así que sale recortada a sus límites
     assert meta["detections"][0]["bbox"]["x2"] == float(WIDTH)
+
+
+def test_update_roi_over_the_same_socket_crops_the_inference_input(client):
+    with client.websocket_connect("/ws/inference-stream?infer_every_n_frames=1") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "update_roi", "request_id": "r1", "roi": {"x1": 4, "y1": 6, "x2": 40, "y2": 30}})
+        ack = _receive_until(ws, lambda kind, p: kind == "json")
+        assert ack["type"] == "roi_updated" and ack["roi_version"] == 1
+        _receive_until(ws, lambda kind, p: kind == "frame" and p["roi_version"] == 1 and p["detections_status"] == "ok")
+
+        ws.send_json({"type": "update_roi", "roi": {"x1": -1, "y1": 0, "x2": 5, "y2": 5}})
+        error = _receive_until(ws, lambda kind, p: kind == "json")
+        assert error["error"] == "INVALID_ROI" and error["recoverable"] is True
+        # Sigue transmitiendo con la última ROI válida
+        meta = _receive_until(ws, lambda kind, p: kind == "frame" and p["roi_version"] == 1)
+        assert meta["roi"] == {"x1": 4, "y1": 6, "x2": 40, "y2": 30}
+
+    assert ((24, 36), (4, 6)) in client.localize_calls  # recorte (alto, ancho) y desplazamiento
+
+
+def test_invalid_roi_in_the_url_is_reported_without_closing_the_socket(client):
+    with client.websocket_connect("/ws/inference-stream?roi=-1,0,5,5&infer_every_n_frames=1") as ws:
+        assert ws.receive_json()["connected"] is True
+        notice = ws.receive_json()
+        assert notice["error"] == "INVALID_ROI" and notice["recoverable"] is True
+        meta = _receive_until(ws, lambda kind, p: kind == "frame")
+    assert meta["roi"] is None
