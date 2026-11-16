@@ -10,6 +10,7 @@ import type { FrameWorkerResult } from '../workers/frameDeserializer';
 import { clearDetections, redrawDetections } from '../utils/detectionDrawing';
 import { computeContainFit } from '../utils/bboxTransform';
 import { FrameBuffer } from '../utils/frameBuffer';
+import { ReconnectScheduler } from '../utils/reconnectScheduler';
 import { WS_URL } from '../config';
 import {
   flushLiveInferenceFrame,
@@ -126,11 +127,8 @@ export function useCameraStream(
 
   // Mutable refs that must not trigger re-renders
   const frameBuffer = useRef(new FrameBuffer(3));
-  const backoffRef = useRef(500);
   /** T-015: instante en que empezó la caída actual; null si el stream está sano. */
   const downSinceRef = useRef<number | null>(null);
-  const destroyedRef = useRef(false);
-  const connectRef = useRef<() => void>(() => {});
   const wsRef = useRef<WebSocket | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastFrameAtRef = useRef(0);
@@ -222,7 +220,7 @@ export function useCameraStream(
     };
   }, []);
 
-  // T-11 + T-13 + T-15 + T-16: WebSocket + Worker + reconnect + watchdog
+    // T-11 + T-13 + T-15 + T-16: WebSocket + Worker + reconnect + watchdog
   useEffect(() => {
     /** Olvida el último frame pintado y limpia la capa de detecciones */
     const resetDrawnFrame = () => {
@@ -231,8 +229,13 @@ export function useCameraStream(
       if (detectionCanvasRef.current) clearDetections(detectionCanvasRef.current);
     };
 
-    destroyedRef.current = false;
-    backoffRef.current = 500;
+    // HU-11: estado PROPIO de esta ejecución del efecto. Antes `destroyed` y el
+    // temporizador eran compartidos entre ejecuciones: al cambiar de URL el
+    // temporizador de la conexión anterior revivía con `destroyed` ya en false y
+    // abría un socket duplicado que el backend rechazaba (CAMERA_BUSY), y cada
+    // rechazo programaba otro reintento sin fin.
+    let destroyed = false;
+    const reconnect = new ReconnectScheduler(500, 30_000);
     downSinceRef.current = null;
     lastFrameAtRef.current = 0;
     frameBuffer.current.clear();
@@ -247,6 +250,7 @@ export function useCameraStream(
       const { metadata, jpeg } = event.data;
       lastFrameAtRef.current = Date.now();
       downSinceRef.current = null; // T-015: llegó un frame, la caída terminó
+      reconnect.reset(); // HU-11: solo un frame real prueba que la conexión es sana
       frameBuffer.current.push({ jpeg, metadata });
 
       const liveMeta = liveEventMetaRef.current;
@@ -255,26 +259,24 @@ export function useCameraStream(
       }
     };
 
-    // T-15: connect function stored in ref to avoid stale closures
     function connect() {
-      if (destroyedRef.current) return;
+      if (destroyed) return;
 
       const ws = new WebSocket(wsUrl);
       ws.binaryType = 'blob';
       wsRef.current = ws;
 
       ws.onopen = () => {
-        backoffRef.current = 500;
+        // HU-11: el backoff ya no se reinicia aquí. Un socket rechazado (CAMERA_BUSY)
+        // también "abre" antes de cerrarse, y reiniciarlo provocaba reintentos cada 500 ms.
         // T-015: la conexión nueva aún no ha dado frames; sin esto el watchdog (T-16)
         // usa la hora del último frame de la conexión anterior y la cierra al instante.
         lastFrameAtRef.current = 0;
         frameBuffer.current.clear(); // T-015: volvió la conexión; descarta frames viejos del corte
-        setIsConnected(true);
-        setConnectionState('connected');
-        setError(null);
       };
 
       ws.onmessage = async (event: MessageEvent) => {
+        if (destroyed || wsRef.current !== ws) return; // HU-11: socket de una ejecución anterior
         if (typeof event.data === 'string') {
           try {
             const handshake = JSON.parse(event.data) as {
@@ -283,6 +285,11 @@ export function useCameraStream(
             };
             if (!handshake.connected) {
               setError(handshake.description ?? 'No se detectó ninguna cámara.');
+            } else {
+              // HU-11: solo el handshake aceptado cuenta como conectado; un rechazo no.
+              setIsConnected(true);
+              setConnectionState('connected');
+              setError(null);
             }
           } catch {
             // unknown text message, ignore
@@ -296,9 +303,14 @@ export function useCameraStream(
         worker.postMessage(buffer, [buffer]);
       };
 
-      ws.onerror = () => setError('Error en la conexión WebSocket');
+      ws.onerror = () => {
+        if (!destroyed) setError('Error en la conexión WebSocket');
+      };
 
       ws.onclose = () => {
+        // HU-11: si esta ejecución ya se limpió, el cierre es nuestro y no debe tocar
+        // el estado ni reintentar: la ejecución nueva se encarga de su conexión.
+        if (destroyed) return;
         setIsConnected(false);
         wsRef.current = null;
         // Desconexión: asegura que el último frame analizado quede guardado.
@@ -306,25 +318,27 @@ export function useCameraStream(
         // Sin stream no se deben quedar cajas ni datos congelados del último frame
         resetDrawnFrame();
         setFrameMetadata(null);
-        if (!destroyedRef.current) {
-          // T-015: cuenta la caída desde el primer cierre; si supera el tope, se rinde
-          if (downSinceRef.current === null) downSinceRef.current = Date.now();
-          if (Date.now() - downSinceRef.current >= MAX_RECONNECT_MS) {
-            setConnectionState('disconnected');
-            return;
-          }
-          // T-15: exponential backoff
-          setConnectionState('reconnecting');
-          setTimeout(connectRef.current, backoffRef.current);
-          backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
+        // T-015: cuenta la caída desde el primer cierre; si supera el tope, se rinde
+        if (downSinceRef.current === null) downSinceRef.current = Date.now();
+        if (Date.now() - downSinceRef.current >= MAX_RECONNECT_MS) {
+          setConnectionState('disconnected');
+          return;
         }
+        // T-15: exponential backoff (un único reintento pendiente)
+        setConnectionState('reconnecting');
+        reconnect.schedule(connect);
       };
     }
 
-    connectRef.current = connect;
-
     // Start initial connection after a tick (StrictMode safety)
     const initTimer = setTimeout(() => {
+      // HU-11: al cambiar de URL (Iniciar / Detener inspección) el backend cierra y vuelve a
+      // abrir la cámara, y eso tarda. Sin esto la pantalla conservaba el último frame y
+      // parecía congelada; ahora se limpia y LiveViewer muestra "Conectando stream…".
+      const canvas = canvasRef.current;
+      canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+      setIsConnected(false);
+      setFrameMetadata(null);
       setConnectionState('connecting');
       connect();
     }, 0);
@@ -340,7 +354,8 @@ export function useCameraStream(
     }, 1000);
 
     return () => {
-      destroyedRef.current = true;
+      destroyed = true;
+      reconnect.cancel(); // HU-11: ningún reintento de esta conexión puede sobrevivir
       clearTimeout(initTimer);
       clearInterval(watchdogInterval);
       worker.terminate();
