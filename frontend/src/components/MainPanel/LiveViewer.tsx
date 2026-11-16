@@ -1,15 +1,16 @@
 import type { Camera, Job } from '../../types/index';
 import type { ApiModel } from '../../types';
 import { useCameraStream } from '../../hooks/useCameraStream';
-import { useMemo } from 'react';
 import { useROIStore } from '../../store/roiStore';
-import { roiToBackendParams } from '../../utils/roiUtils';
+import { roiToBackendParams, type ROIPixelCoords } from '../../utils/roiUtils';
+import { nextSnapshot, type Snapshot } from '../../utils/roiSnapshot';
 import { ButtonCommon } from '../CommonComponents';
 import { ROICanvas } from './ROICanvas';
 import { TopBar } from '../Toolbar';
 import { ROICoordinatesPanel } from './ROICoordinatesPanel';
 import { MenuOptions } from './MenuOptions';
 import { DetectionCanvas } from './DetectionCanvas';
+import { useMemo, useState } from 'react';
 
 interface LiveViewerProps {
   camera: Camera;
@@ -58,19 +59,34 @@ export function LiveViewer({
   const isInspectionRunning = job.status === 'running';
   const rois = useROIStore((s) => s.rois);
 
+  // HU-11: tamaño REAL del frame, medido por el hook al decodificar el primer frame del
+  // stream (el backend envía el frame completo, sin reescalar). `camera.resolution` es un
+  // valor fijo de 1920×1080 y solo se usa como respaldo hasta que llega ese primer frame.
+  const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
+  const roiBaseWidth = frameSize?.width ?? camera.resolution.width;
+  const roiBaseHeight = frameSize?.height ?? camera.resolution.height;
+
   const streamRoi = useMemo(() => {
     const activeRoi = rois.find((roi) => roi.cameraId === cameraId && roi.isEnabled);
     if (!activeRoi) return null;
-    return roiToBackendParams(activeRoi, {
-      width: camera.resolution.width,
-      height: camera.resolution.height,
-    });
-  }, [rois, cameraId, camera.resolution.width, camera.resolution.height]);
+    return roiToBackendParams(activeRoi, { width: roiBaseWidth, height: roiBaseHeight });
+  }, [rois, cameraId, roiBaseWidth, roiBaseHeight]);
 
   // El stream de inferencia en vivo solo devuelve detecciones de modelos de localización
   const jobModel = models.find((m) => m.id === job.modelId);
   const isDetectionModel = jobModel?.task === 'localization';
   const isLiveInference = isInspectionRunning && isDetectionModel;
+
+  // HU-11: el ROI va en la URL del WebSocket, así que moverlo durante la inspección
+  // reconectaba el stream en cada cambio. Se fija al iniciar; los cambios aplican al
+  // siguiente inicio. Se ajusta durante el render (patrón de React) para no mostrar un
+  // render intermedio con el ROI sin fijar.
+  const [roiSnapshot, setRoiSnapshot] = useState<Snapshot<ROIPixelCoords | null>>(null);
+  const nextRoiSnapshot = nextSnapshot(roiSnapshot, isLiveInference, streamRoi);
+  if (nextRoiSnapshot !== roiSnapshot) {
+    setRoiSnapshot(nextRoiSnapshot);
+  }
+  const inferenceRoi = nextRoiSnapshot ? nextRoiSnapshot.value : streamRoi;
 
   const streamOptions = useMemo(
     () =>
@@ -78,18 +94,26 @@ export function LiveViewer({
         ? {
             mode: 'inference' as const,
             modelId: job.modelId,
-            roi: streamRoi,
+            roi: inferenceRoi,
           }
         : {
             mode: 'stream' as const,
           },
-    [isLiveInference, job.modelId, streamRoi]
+    [isLiveInference, job.modelId, inferenceRoi]
   );
 
-  const { canvasRef, detectionCanvasRef, isConnected, error, displaySize } = useCameraStream(
-    cameraId,
-    streamOptions
-  );
+  const { canvasRef, detectionCanvasRef, isConnected, error, displaySize, naturalSize } =
+    useCameraStream(cameraId, streamOptions);
+
+  // HU-11: guarda el tamaño real del frame para convertir el ROI con él. Se ajusta durante
+  // el render (patrón de React para derivar estado) porque el hook se llama después de
+  // calcular streamRoi y no se puede leer su resultado antes.
+  if (
+    naturalSize &&
+    (frameSize?.width !== naturalSize.width || frameSize?.height !== naturalSize.height)
+  ) {
+    setFrameSize(naturalSize);
+  }
 
   return (
     <div className="flex flex-col items-center gap-3 min-h-0 mt-10">
@@ -128,8 +152,8 @@ export function LiveViewer({
       {activeItem &&(
         <MenuOptions
           cameraId={cameraId}
-          naturalWidth={naturalWidth}
-          naturalHeight={naturalHeight}
+          naturalWidth={frameSize?.width ?? naturalWidth}
+          naturalHeight={frameSize?.height ?? naturalHeight}
           menuOptionSelected={activeItem}
         />
       )}
