@@ -5,6 +5,10 @@ import { useModels } from '../../hooks/useModels';
 import { useLastInferenceEvent } from '../../hooks/useLastInferenceEvent';
 import { recordInferenceEvent } from '../../services/lastInferenceEvent';
 import {
+  clearManualInferenceError,
+  notifyManualInferenceError,
+} from '../../services/errorNotifier';
+import {
   parseInferenceError,
   runAnomaly,
   runClassification,
@@ -209,6 +213,7 @@ export function InferencePanel() {
     if (!selectedModelId || !image) return;
     setStatus('running');
     setErrorMessage(null);
+    clearManualInferenceError(); // T-036: un intento nuevo quita el aviso anterior
     const roiParam = roiEnabled ? roi : undefined;
 
     try {
@@ -241,8 +246,11 @@ export function InferencePanel() {
         result: next,
       });
     } catch (err) {
-      setErrorMessage(parseInferenceError(err));
+      const message = parseInferenceError(err);
+      // El texto junto al botón se queda; el toast agrega "Reintentar" (T-036)
+      setErrorMessage(message);
       setStatus('error');
+      notifyManualInferenceError(message, () => void handleRun());
     }
   };
 

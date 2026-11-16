@@ -6,6 +6,8 @@ import { useInferenceStream } from '../../hooks/useInferenceStream';
 import { BBoxOverlay } from './BBoxOverlay';
 import { colorForClass } from '../../utils/detectionColors'; // T-30: paleta fija por clase
 import { ButtonCommon } from '../CommonComponents';
+import { StreamSessionNotice } from '../MainPanel/StreamSessionNotice';
+import { CONNECTING_STATUS } from '../../utils/streamSession';
 
 interface SliderProps {
   label: string;
@@ -103,18 +105,21 @@ interface LiveInferenceStreamProps {
 }
 
 function LiveInferenceStream({ cameraId, conf, iou, inferEveryNFrames }: LiveInferenceStreamProps) {
-  const { frameUrl, detections, isConnected, error } = useInferenceStream(cameraId, {
+  const { frameUrl, detections, session, connectionState, retry } = useInferenceStream(cameraId, {
     conf,
     iou,
     inferEveryNFrames,
   });
 
-  if (error) {
-    return <p className="text-[13px] font-semibold text-[#d64545]">{error}</p>;
-  }
-
-  if (!isConnected || !frameUrl) {
-    return <p className="text-[13px] text-[#6b7280]">Conectando…</p>;
+  // HU-12: mientras no haya sesión activa con frame, se muestra su estado
+  if (session.state !== 'active' || !frameUrl) {
+    return (
+      <StreamSessionNotice
+        session={session.state === 'active' ? CONNECTING_STATUS : session}
+        connectionState={connectionState}
+        onRetry={retry}
+      />
+    );
   }
 
   return (

@@ -6,3 +6,4 @@ export * from './FrameTypes';
 export * from './ROITypes';
 export * from './DetectionTypes';
 export * from './InferenceTypes';
+export * from './StreamSessionTypes';
