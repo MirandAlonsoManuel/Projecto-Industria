@@ -29,6 +29,8 @@ export function useCameraSignal(intervalMs = 3000): UseCameraSignalResult {
   const { data, isPending, isError } = useQuery({
     queryKey: queryKeys.signal,
     queryFn: checkSignal,
+    // T-036: corre cada 3 s; solo avisa si el servidor está caído (un único toast)
+    meta: { notify: 'network-only' },
     refetchInterval: intervalMs,
     // 'always': debe seguir consultando aunque onlineManager marque offline,
     // si no nunca se detectaría la reconexión.

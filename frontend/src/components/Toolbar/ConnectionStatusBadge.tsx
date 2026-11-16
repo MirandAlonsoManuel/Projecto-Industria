@@ -11,7 +11,8 @@ import type { CameraConnectionStatus } from '../../types/indexTypes';
  *   error          → rojo   ●
  *
  * El componente es puramente presentacional: recibe el status y
- * lo muestra. El valor real viene del store vía el hook useCameraStatus.
+ * lo muestra. T-035: el valor real viene de store/inferenceConnectionStore
+ * (eventos del WebSocket), lo traduce TopBar con connectionBadge().
  */
 
 interface ConnectionStatusBadgeProps {
@@ -20,6 +21,10 @@ interface ConnectionStatusBadgeProps {
   cameraName?: string;
   /** Permite ocultar la etiqueta de texto y mostrar solo el punto (para barras compactas) */
   compact?: boolean;
+  /** T-035: reemplaza la etiqueta por defecto del estado (p. ej. "Reconectando...") */
+  label?: string;
+  /** T-035: detalle del último error, se muestra en el popover */
+  detail?: string | null;
 }
 
 const badgeClasses =
@@ -53,8 +58,10 @@ export function ConnectionStatusBadge({
   status,
   cameraName,
   compact = false,
+  label,
+  detail,
 }: ConnectionStatusBadgeProps) {
-  const meta = STATUS_META[status];
+  const meta = { ...STATUS_META[status], label: label ?? STATUS_META[status].label };
   const isPulsing =
     status === 'connecting' || status === 'disconnecting';
 
@@ -110,6 +117,13 @@ export function ConnectionStatusBadge({
           <span className='font-semibold'>Resolución y FPS</span>
           <span className='font-light'>1920 × 1080, 30</span>
         </div>
+
+        {detail && (
+          <div className="flex justify-between gap-2 border-t border-gray-200 py-0 text-[10px] dark:text-white">
+            <span className='font-semibold'>Último error</span>
+            <span className='font-light text-right'>{detail}</span>
+          </div>
+        )}
       </div>
     </div>
   );

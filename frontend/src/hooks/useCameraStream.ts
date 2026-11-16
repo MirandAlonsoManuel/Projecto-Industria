@@ -3,9 +3,24 @@
  * T-13: Canvas rAF draw loop, ResizeObserver, Worker integration, bbox overlay
  * T-15: Exponential backoff reconnect
  * T-16: Watchdog for frozen streams
+ * HU-12: estado de la sesión (connecting/active/stopped/disconnected/error) y
+ *        reconexión solo ante errores recuperables
+ * T-035: publica onopen/onclose/onerror en el store global de conexión
  */
-import { useState, useEffect, useRef } from 'react';
-import type { FrameMetadata } from '../types';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { roiToBackendParams, type NormalizedROI, type ROIPixelCoords } from '../utils/roiUtils';
+import type { FrameMetadata, StreamSessionStatus } from '../types';
+import {
+  CONNECTING_STATUS,
+  STREAM_FROZEN_CLOSE_CODE,
+  parseControlMessage,
+  shouldReconnect,
+  statusFromClose,
+} from '../utils/streamSession';
+import {
+  nextConnectionOwner,
+  useInferenceConnectionStore,
+} from '../store/inferenceConnectionStore';
 import type { FrameWorkerResult } from '../workers/frameDeserializer';
 import { clearDetections, redrawDetections } from '../utils/detectionDrawing';
 import { computeContainFit } from '../utils/bboxTransform';
@@ -29,10 +44,21 @@ interface CameraStreamOptions {
   conf?: number;
   iou?: number;
   inferEveryNFrames?: number;
-  roi?: { x1: number; y1: number; x2: number; y2: number } | null;
+  /**
+   * ROI normalizado (0–1). El hook lo convierte a píxeles con el tamaño REAL del frame
+   * que llega por el stream, no con una resolución supuesta de la cámara.
+   */
+  roi?: NormalizedROI | null;
 }
 
-function buildWsUrl(cameraId: string, options: CameraStreamOptions): string {
+/** Tras este tiempo abierta, una conexión se considera sana y el siguiente corte reinicia la espera */
+const STABLE_CONNECTION_MS = 5_000;
+
+function buildWsUrl(
+  cameraId: string,
+  options: CameraStreamOptions,
+  pixelRoi: ROIPixelCoords | null
+): string {
   const params = new URLSearchParams();
   params.set('camera_id', cameraId);
 
@@ -43,11 +69,11 @@ function buildWsUrl(cameraId: string, options: CameraStreamOptions): string {
     if (options.inferEveryNFrames !== undefined) {
       params.set('infer_every_n_frames', String(options.inferEveryNFrames));
     }
-    if (options.roi) {
-      params.set('x1', String(options.roi.x1));
-      params.set('y1', String(options.roi.y1));
-      params.set('x2', String(options.roi.x2));
-      params.set('y2', String(options.roi.y2));
+    if (pixelRoi) {
+      params.set('x1', String(pixelRoi.x1));
+      params.set('y1', String(pixelRoi.y1));
+      params.set('x2', String(pixelRoi.x2));
+      params.set('y2', String(pixelRoi.y2));
     }
   }
 
@@ -106,6 +132,10 @@ interface UseCameraStreamResult {
    * Se actualiza en el mismo paso en que se pinta el frame; null si no hay stream.
    */
   frameMetadata: FrameMetadata | null;
+  /** HU-12: estado de la sesión con código, descripción y si es recuperable */
+  session: StreamSessionStatus;
+  /** HU-12: vuelve a conectar a mano (tras un fin de sesión o un error no recuperable) */
+  retry: () => void;
 }
 
 export function useCameraStream(
@@ -123,32 +153,40 @@ export function useCameraStream(
     height: 0,
   });
   const [frameMetadata, setFrameMetadata] = useState<FrameMetadata | null>(null);
+  const [session, setSession] = useState<StreamSessionStatus>(CONNECTING_STATUS);
 
   // Mutable refs that must not trigger re-renders
   const frameBuffer = useRef(new FrameBuffer(3));
   const backoffRef = useRef(500);
   /** T-015: instante en que empezó la caída actual; null si el stream está sano. */
   const downSinceRef = useRef<number | null>(null);
-  const destroyedRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
   const wsRef = useRef<WebSocket | null>(null);
+  /** HU-12: último estado recibido; decide qué pasa al cerrarse el socket */
+  const sessionRef = useRef<StreamSessionStatus>(CONNECTING_STATUS);
   const rafRef = useRef<number | null>(null);
   const lastFrameAtRef = useRef(0);
   const naturalSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const detectionsRef = useRef<LocalizationDetection[]>([]);
-  const wsUrl = buildWsUrl(cameraId, options);
+  const { modelId, roi } = options;
+  // El ROI se manda en píxeles del frame real. Si aún no llegó ningún frame no se
+  // conoce su tamaño: se conecta sin ROI y, al llegar el primero, se reconecta con él.
+  const pixelRoi = useMemo(
+    () => (roi && naturalSize ? roiToBackendParams(roi, naturalSize) : null),
+    [roi, naturalSize]
+  );
+  const wsUrl = buildWsUrl(cameraId, options, pixelRoi);
   const lastDrawnRef = useRef<DrawnFrame | null>(null);
 
   // Datos del análisis en vivo para el "último evento". null fuera del modo inferencia:
   // el stream sin modelo no es un evento de inferencia y no debe pisar el guardado.
   const liveEventMetaRef = useRef<Omit<LiveInferenceFrame, 'jpeg' | 'detections'> | null>(null);
   const isInference = options.mode === 'inference';
-  const { modelId, roi } = options;
+  const endpoint = isInference ? 'inference' : 'stream';
   useEffect(() => {
     liveEventMetaRef.current = isInference
-      ? { cameraId, modelId: modelId ?? null, roi: roi ?? null }
+      ? { cameraId, modelId: modelId ?? null, roi: pixelRoi }
       : null;
-  }, [cameraId, isInference, modelId, roi]);
+  }, [cameraId, isInference, modelId, pixelRoi]);
 
   // T-13: ResizeObserver — runs once, canvas is always in DOM
   useEffect(() => {
@@ -231,12 +269,24 @@ export function useCameraStream(
       if (detectionCanvasRef.current) clearDetections(detectionCanvasRef.current);
     };
 
-    destroyedRef.current = false;
+    // Propio de esta ejecución del efecto: los eventos de un socket viejo (de antes
+    // de cambiar de URL o desmontar) no deben tocar la conexión nueva.
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // T-035: esta ejecución publica en el store con su propio id de dueño
+    const connection = useInferenceConnectionStore.getState();
+    const owner = nextConnectionOwner(endpoint);
+
     backoffRef.current = 500;
     downSinceRef.current = null;
     lastFrameAtRef.current = 0;
     frameBuffer.current.clear();
     resetDrawnFrame();
+
+    const updateSession = (status: StreamSessionStatus) => {
+      sessionRef.current = status;
+      setSession(status);
+    };
 
     // Worker for frame deserialization
     const worker = new Worker(new URL('../workers/frameDeserializer.ts', import.meta.url), {
@@ -246,7 +296,6 @@ export function useCameraStream(
     worker.onmessage = (event: MessageEvent<FrameWorkerResult>) => {
       const { metadata, jpeg } = event.data;
       lastFrameAtRef.current = Date.now();
-      downSinceRef.current = null; // T-015: llegó un frame, la caída terminó
       frameBuffer.current.push({ jpeg, metadata });
 
       const liveMeta = liveEventMetaRef.current;
@@ -257,14 +306,21 @@ export function useCameraStream(
 
     // T-15: connect function stored in ref to avoid stale closures
     function connect() {
-      if (destroyedRef.current) return;
+      if (disposed) return;
+      reconnectTimer = null;
 
       const ws = new WebSocket(wsUrl);
       ws.binaryType = 'blob';
       wsRef.current = ws;
+      // HU-12: cada intento empieza en connecting; pasa a active con la bienvenida
+      updateSession(CONNECTING_STATUS);
+      connection.socketConnecting(owner, endpoint);
+      /** Instante de apertura de ESTE socket; 0 si nunca abrió */
+      let openedAt = 0;
 
       ws.onopen = () => {
-        backoffRef.current = 500;
+        if (disposed) return;
+        openedAt = Date.now();
         // T-015: la conexión nueva aún no ha dado frames; sin esto el watchdog (T-16)
         // usa la hora del último frame de la conexión anterior y la cierra al instante.
         lastFrameAtRef.current = 0;
@@ -272,20 +328,17 @@ export function useCameraStream(
         setIsConnected(true);
         setConnectionState('connected');
         setError(null);
+        connection.socketOpened(owner);
       };
 
       ws.onmessage = async (event: MessageEvent) => {
+        if (disposed) return;
         if (typeof event.data === 'string') {
-          try {
-            const handshake = JSON.parse(event.data) as {
-              connected: boolean;
-              description?: string;
-            };
-            if (!handshake.connected) {
-              setError(handshake.description ?? 'No se detectó ninguna cámara.');
-            }
-          } catch {
-            // unknown text message, ignore
+          // HU-12: bienvenida, aviso de fin o error → estado de la sesión
+          const status = parseControlMessage(event.data);
+          if (status) {
+            updateSession(status);
+            setError(status.state === 'active' ? null : status.description);
           }
           return;
         }
@@ -293,31 +346,57 @@ export function useCameraStream(
 
         // Transfer ArrayBuffer to worker (zero-copy)
         const buffer = await event.data.arrayBuffer();
+        if (disposed) return;
         worker.postMessage(buffer, [buffer]);
       };
 
-      ws.onerror = () => setError('Error en la conexión WebSocket');
+      ws.onerror = () => {
+        if (disposed) return;
+        setError('Error en la conexión WebSocket');
+        connection.socketErrored(owner, 'Error en la conexión WebSocket');
+      };
 
-      ws.onclose = () => {
+      ws.onclose = (event: CloseEvent) => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (disposed) return;
         setIsConnected(false);
-        wsRef.current = null;
         // Desconexión: asegura que el último frame analizado quede guardado.
         flushLiveInferenceFrame();
         // Sin stream no se deben quedar cajas ni datos congelados del último frame
         resetDrawnFrame();
         setFrameMetadata(null);
-        if (!destroyedRef.current) {
-          // T-015: cuenta la caída desde el primer cierre; si supera el tope, se rinde
-          if (downSinceRef.current === null) downSinceRef.current = Date.now();
-          if (Date.now() - downSinceRef.current >= MAX_RECONNECT_MS) {
-            setConnectionState('disconnected');
-            return;
-          }
-          // T-15: exponential backoff
-          setConnectionState('reconnecting');
-          setTimeout(connectRef.current, backoffRef.current);
-          backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
+
+        // HU-12: el aviso previo del servidor (si lo hubo) decide si se reintenta
+        const final = statusFromClose(event.code, sessionRef.current);
+        updateSession(final);
+        setError(final.description);
+        if (!shouldReconnect(final)) {
+          // Fin intencional o error no recuperable: se espera a que el usuario reintente
+          setConnectionState('disconnected');
+          connection.socketClosed(owner, final, false);
+          return;
         }
+
+        // Solo una conexión que se sostuvo un rato reinicia la espera. Si falla recién
+        // abierta (p. ej. un error que se repite igual en cada intento), la espera crece
+        // y al llegar al tope se deja de reintentar, en vez de insistir cada 500 ms.
+        if (openedAt > 0 && Date.now() - openedAt >= STABLE_CONNECTION_MS) {
+          backoffRef.current = 500;
+          downSinceRef.current = null;
+        }
+
+        // T-015: cuenta la caída desde el primer cierre; si supera el tope, se rinde
+        if (downSinceRef.current === null) downSinceRef.current = Date.now();
+        if (Date.now() - downSinceRef.current >= MAX_RECONNECT_MS) {
+          setConnectionState('disconnected');
+          connection.socketClosed(owner, final, false);
+          return;
+        }
+        // T-15: exponential backoff
+        setConnectionState('reconnecting');
+        connection.socketClosed(owner, final, true);
+        reconnectTimer = setTimeout(connect, backoffRef.current);
+        backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
       };
     }
 
@@ -334,14 +413,17 @@ export function useCameraStream(
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         if (lastFrameAtRef.current > 0 && Date.now() - lastFrameAtRef.current > 5000) {
-          ws.close(); // triggers reconnect via onclose
+          // HU-12: código propio para que onclose lo reporte como STREAM_FROZEN y reintente
+          ws.close(STREAM_FROZEN_CLOSE_CODE, 'STREAM_FROZEN');
         }
       }
     }, 1000);
 
     return () => {
-      destroyedRef.current = true;
+      disposed = true;
+      connection.socketReleased(owner);
       clearTimeout(initTimer);
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       clearInterval(watchdogInterval);
       worker.terminate();
       flushLiveInferenceFrame();
@@ -349,7 +431,18 @@ export function useCameraStream(
       if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
       wsRef.current = null;
     };
-  }, [wsUrl]);
+  }, [wsUrl, endpoint]);
+
+  // HU-12: reconexión manual; no hace nada si ya hay un socket abierto o abriéndose
+  const retry = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState < WebSocket.CLOSING) return;
+    backoffRef.current = 500;
+    downSinceRef.current = null;
+    setConnectionState('connecting');
+    setError(null);
+    connectRef.current();
+  }, []);
 
   return {
     canvasRef,
@@ -360,5 +453,7 @@ export function useCameraStream(
     naturalSize,
     displaySize,
     frameMetadata,
+    session,
+    retry,
   };
 }

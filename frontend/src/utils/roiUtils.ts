@@ -26,11 +26,15 @@ export interface NaturalSize {
  * Returns { x1, y1, x2, y2 } with Math.round applied.
  */
 export function roiToBackendParams(roi: NormalizedROI, naturalSize: NaturalSize): ROIPixelCoords {
+  // Se recorta a los bordes de la imagen: un ROI pegado al borde (o el redondeo)
+  // no debe salirse, porque el backend lo rechaza con "ROI fuera de los límites".
+  const clampX = (v: number) => Math.min(Math.max(Math.round(v), 0), naturalSize.width);
+  const clampY = (v: number) => Math.min(Math.max(Math.round(v), 0), naturalSize.height);
   return {
-    x1: Math.round(roi.x * naturalSize.width),
-    y1: Math.round(roi.y * naturalSize.height),
-    x2: Math.round((roi.x + roi.width) * naturalSize.width),
-    y2: Math.round((roi.y + roi.height) * naturalSize.height),
+    x1: clampX(roi.x * naturalSize.width),
+    y1: clampY(roi.y * naturalSize.height),
+    x2: clampX((roi.x + roi.width) * naturalSize.width),
+    y2: clampY((roi.y + roi.height) * naturalSize.height),
   };
 }
 
