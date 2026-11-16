@@ -233,7 +233,33 @@ def test_inferencia_lenta_no_frena_el_video():
     ws = asyncio.run(scenario())
 
     assert len(ws.frames) >= 15
-    assert ws.frames[-1]["detections"] == [{"class_id": 1}]
+    # Contrato "imagen y detecciones del mismo frame": una inferencia que no termina
+    # a tiempo no se reutiliza sobre frames posteriores. Esos frames salen sin cajas
+    # y con el motivo en `detections_status`.
+    assert all(f["detections"] == [] for f in ws.frames)
+    assert {f["detections_status"] for f in ws.frames} <= {"timeout", "busy"}
+
+
+def test_inferencia_rapida_entrega_detecciones_del_mismo_frame():
+    def fast_infer(frame):
+        time.sleep(0.01)
+        return [{"class_id": 1}]
+
+    async def scenario():
+        ws = FakeWebSocket()
+        await _serve_for(
+            ws, FakeCapture(), CameraSessionManager(), duration=0.8, infer=fast_infer
+        )
+        return ws
+
+    ws = asyncio.run(scenario())
+
+    con_cajas = [f for f in ws.frames if f["detections"]]
+    assert con_cajas
+    assert all(f["detections"] == [{"class_id": 1}] for f in con_cajas)
+    # Solo llevan cajas los frames cuya propia inferencia terminó a tiempo
+    assert all(f["detections_status"] == "ok" for f in con_cajas)
+    assert all(f["detections"] == [] for f in ws.frames if f["detections_status"] != "ok")
 
 
 def test_error_de_inferencia_cierra_con_1011():

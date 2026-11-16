@@ -24,6 +24,7 @@ def encode_ws_message(
     jpeg_quality: int = 70,
     seq: int = 0,
     captured_at: Optional[float] = None,
+    extra: Optional[dict] = None,
 ) -> bytes:
     """
     Serializa frame + metadatos al protocolo binario del WebSocket.
@@ -31,6 +32,9 @@ def encode_ws_message(
     `timestamp` es el instante de captura del frame cuando se conoce (si no,
     el de serialización), de modo que el cliente pueda medir la latencia real
     de extremo a extremo.
+
+    `extra` agrega campos de metadatos (por ejemplo frame_width, frame_height,
+    captured_at, detections_status, roi) sin poder sobrescribir los básicos.
     """
     metadata = {
         "connected": True,
@@ -40,6 +44,9 @@ def encode_ws_message(
         "seq": seq,
         "detections": detections,
     }
+    if extra:
+        for key, value in extra.items():
+            metadata.setdefault(key, value)
     json_bytes = json.dumps(metadata).encode("utf-8")
     header = struct.pack(">I", len(json_bytes))
     _, jpeg_buf = cv2.imencode(
