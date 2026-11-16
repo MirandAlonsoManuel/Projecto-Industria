@@ -31,11 +31,14 @@ import {
   recordLiveInferenceFrame,
   type LiveInferenceFrame,
 } from '../services/lastInferenceEvent';
+import { useDetectionColorStore } from '../store/detectionColorStore';
+import type { AccuracyLevel } from '../store/detectionColorStore';
 
 const STREAM_WS_URL = `${WS_URL}/ws/stream`;
 const INFERENCE_WS_URL = `${WS_URL}/ws/inference-stream`;
 /** T-015: tiempo máximo de caída continua antes de pasar a 'disconnected' y dejar de reintentar (2 min). */
 const MAX_RECONNECT_MS = 120_000;
+
 
 interface CameraStreamOptions {
   /** 'inference' abre /ws/inference-stream y cada frame trae sus detecciones */
@@ -95,7 +98,8 @@ interface DrawnFrame {
 function paintFrame(
   canvas: HTMLCanvasElement,
   overlay: HTMLCanvasElement | null,
-  { bitmap, metadata }: DrawnFrame
+  { bitmap, metadata }: DrawnFrame,
+  levels: AccuracyLevel[]
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -108,7 +112,7 @@ function paintFrame(
 
   // Overlay del MISMO frame: se limpia y redibuja, sin acumular
   if (overlay) {
-    redrawDetections(overlay, metadata.detections, frameSize, display, metadata.sourceSize);
+    redrawDetections(overlay, metadata.detections, frameSize, display, metadata.sourceSize, levels);
   }
 }
 
@@ -144,6 +148,11 @@ export function useCameraStream(
 ): UseCameraStreamResult {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const detectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const accuracyLevels = useDetectionColorStore((state) => state.levels);
+  const accuracyLevelsRef = useRef(accuracyLevels);
+  useEffect(() => {
+    accuracyLevelsRef.current = accuracyLevels;
+  }, [accuracyLevels]);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionState, setConnectionState] = useState<WebSocketConnectionState>('connecting');
   const [error, setError] = useState<string | null>(null);
@@ -204,7 +213,7 @@ export function useCameraStream(
           setDisplaySize({ width: w, height: h });
           // Cambiar el tamaño borra el canvas: se repinta el último frame con la nueva escala
           if (lastDrawnRef.current) {
-            paintFrame(canvas, detectionCanvasRef.current, lastDrawnRef.current);
+            paintFrame(canvas, detectionCanvasRef.current, lastDrawnRef.current, accuracyLevelsRef.current);
           }
         }
       }
@@ -236,7 +245,7 @@ export function useCameraStream(
           }
 
           const drawn: DrawnFrame = { bitmap, metadata: frame.metadata };
-          paintFrame(canvas, detectionCanvasRef.current, drawn);
+          paintFrame(canvas, detectionCanvasRef.current, drawn, accuracyLevelsRef.current);
           lastDrawnRef.current?.bitmap.close();
           lastDrawnRef.current = drawn;
           setFrameMetadata(frame.metadata);

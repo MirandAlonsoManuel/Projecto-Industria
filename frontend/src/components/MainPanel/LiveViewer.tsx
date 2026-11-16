@@ -101,7 +101,7 @@ export function LiveViewer({
     useCameraStream(cameraId, streamOptions);
 
   return (
-    <div className="flex flex-col items-center gap-3 min-h-0 mt-10">
+    <div className="flex flex-col items-center gap-3 min-h-0 mt-16">
 
       {/* TopBar ahora vive aquí */}
       {/* T-035: el indicador de conexión lo toma TopBar del store WS (sin /signal) */}

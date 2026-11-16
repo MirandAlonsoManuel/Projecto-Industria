@@ -220,8 +220,24 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
   // Atajos de teclado para eliminar, deshacer y rehacer cambios
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      const target = e.target;
+
+      // No ejecutar atajos si se está escribiendo en un campo editable
+      if (
+        target instanceof HTMLElement &&
+        (
+          target.isContentEditable ||
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT'
+        )
+      ) {
+        return;
+      }
+
       if (e.key === 'Delete' || e.key === 'Backspace') {
         const { selectedId: sid } = useROIStore.getState();
+
         if (sid) {
           e.preventDefault();
           deleteRoi(sid);
@@ -419,20 +435,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
       {/* T-22 + T-23: Editor de etiqueta sobre el canvas */}
       {selectedRoi && (
         <div
-          style={{
-            position: 'absolute',
-            bottom: 8,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            background: 'rgba(31, 36, 48, 0.92)',
-            borderRadius: 8,
-            padding: '6px 10px',
-            pointerEvents: 'auto',
-            zIndex: 10,
-          }}
+          className="inter absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-[15px] bg-[#F7F7F7] dark:bg-[#393939] rounded-lg px-[10px] py-[6px] pointer-events-auto z-10"
         >
           <input
             value={selectedRoi.label}
@@ -446,28 +449,10 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
               if (trimmed) setLabel(selectedRoi.id, trimmed);
             }}
             placeholder="Etiqueta"
-            style={{
-              height: 28,
-              width: 120,
-              padding: '0 8px',
-              borderRadius: 6,
-              border: '1px solid #3a4155',
-              background: '#2a2f3e',
-              color: '#e5e7eb',
-              fontSize: 12,
-              outline: 'none',
-            }}
+            className="h-7 w-[120px] px-2 rounded-[6px] border border-[#EEEEEE] bg-white text-xs text-[#2e2d2d] outline-none dark:border-[#6D6D6D] dark:bg-[#404040] dark:text-gray-100"
           />
           <label
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-              color: '#9ca3af',
-              fontSize: 12,
-              cursor: 'pointer',
-              userSelect: 'none',
-            }}
+            className="flex items-center gap-1 text-xs text-[#393939] dark:text-white cursor-pointer select-none"
           >
             <input
               type="checkbox"
@@ -480,16 +465,7 @@ export function ROICanvas({ width, height, cameraId }: ROICanvasProps) {
           <button
             type="button"
             onClick={() => deleteRoi(selectedRoi.id)}
-            style={{
-              height: 28,
-              padding: '0 8px',
-              borderRadius: 6,
-              border: 'none',
-              background: '#d64545',
-              color: '#fff',
-              fontSize: 12,
-              cursor: 'pointer',
-            }}
+            className="px-4 py-2 rounded-2xl border bg-[#393939] text-xs text-white cursor-pointer dark:border-[#6d6d6d] dark:bg-[#2D2D2D]"
           >
             Eliminar
           </button>

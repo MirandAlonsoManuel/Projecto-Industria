@@ -2,11 +2,8 @@
  * Paleta fija de colores por clase de detección.
  * El color depende solo del classId, así una clase se ve igual en todos los frames,
  * cámaras y sesiones.
- *
- * PENDIENTE: validar con Esme (diseño). Base: Tableau 10 sin el gris, que se pierde
- * con el fondo gris del visor. Si diseño define otra paleta, solo hay que cambiar
- * DETECTION_PALETTE.
  */
+import type { AccuracyLevel } from '../store/detectionColorStore';
 
 export const DETECTION_PALETTE = [
   '#4E79A7', // azul
@@ -45,4 +42,17 @@ export function labelTextColor(background: string): string {
   // Luminancia percibida (ITU-R BT.601)
   const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
   return luminance > 0.6 ? '#1f2430' : '#fff';
+}
+
+/** Devuelve el color según el nivel de confidence configurado por el usuario */
+export function colorForConfidence(
+  confidence: number,
+  levels: AccuracyLevel[]
+): string {
+  const score = confidence * 100;
+  for (const level of levels) {
+    if (level.operator === '>=' && score >= level.threshold) return level.color;
+    if (level.operator === '<=' && score <= level.threshold) return level.color;
+  }
+  return UNKNOWN_CLASS_COLOR;
 }
