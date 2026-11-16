@@ -1,11 +1,16 @@
 import { useState, useEffect, useMemo } from 'react';
-import type { Camera, CameraProtocol, ROI, Job } from '../../types/index';
+import type { Camera, CameraProtocol, ROI } from '../../types/index';
 import { getCameras, type ApiCamera } from '../../services/cameraApi';
 import { useCameraSignal } from '../../hooks/useCameraSignal';
 import { useModels } from '../../hooks/useModels';
 import { LeftSideBar } from './LeftSidebar';
 import { LiveViewer } from './LiveViewer';
 import { ResultsHistoryPanel, type ResultHistoryItem } from './ResultsHistoryPanel';
+import { useJobStore } from '../../store/jobStore';
+import { useToastStore } from '../../store/toastStore';
+import { useInferenceConnectionStore } from '../../store/inferenceConnectionStore';
+import { JOB_TOAST_KEY, startJobErrorBridge } from '../../store/jobErrorBridge';
+import { validateJobStart } from '../../utils/jobErrors';
 
 const FALLBACK_CAMERA: Camera = {
   id: '0',
@@ -67,12 +72,15 @@ function MainPanel() {
   const { models, isLoading: isLoadingModels } = useModels();
   const [selectedModelId, setSelectedModelId] = useState('');
 
-  const [job, setJob] = useState<Job>({
-    id: 'job-01',
-    cameraId: '0',
-    modelId: '',
-    status: 'idle',
-  });
+  // T-036: el job vive en un store global; aquí solo se lee y se dispara
+  const job = useJobStore((s) => s.job);
+  const startJob = useJobStore((s) => s.start);
+  const stopJob = useJobStore((s) => s.stop);
+  const configureJob = useJobStore((s) => s.configure);
+
+  // T-036: traduce los errores del WebSocket de inferencia en estado del job + toasts.
+  // Solo se suscribe (no cambia estado de React), así que es seguro en un efecto.
+  useEffect(() => startJobErrorBridge(), []);
 
   // /signal es solo health check del servidor — sin camera_id
   const { hasSignal } = useCameraSignal();
@@ -95,23 +103,41 @@ function MainPanel() {
     : { ...FALLBACK_CAMERA, status: hasSignal ? 'connected' : 'disconnected', isActive: hasSignal };
 
   const toggleInspection = () => {
-    setJob((prev) => ({
-      ...prev,
-      cameraId: effectiveCameraId,
+    const toasts = useToastStore.getState();
+    if (job.status === 'running') {
+      stopJob();
+      toasts.dismissByKey(JOB_TOAST_KEY);
+      return;
+    }
+    // T-036: se valida antes de arrancar; si algo falta, no inicia y se avisa qué corregir
+    const problem = validateJobStart({
       modelId: effectiveModelId,
-      status: prev.status === 'running' ? 'stopped' : 'running',
-      startedAt: prev.status === 'running' ? prev.startedAt : Date.now(),
-    }));
+      models,
+      connectionStatus: useInferenceConnectionStore.getState().status,
+    });
+    if (problem) {
+      toasts.show({
+        key: JOB_TOAST_KEY,
+        severity: problem.severity,
+        title: problem.title,
+        message: problem.message,
+        // Un aviso de validación no necesita quedarse fijo
+        durationMs: 6_000,
+      });
+      return;
+    }
+    toasts.dismissByKey(JOB_TOAST_KEY);
+    startJob(effectiveCameraId, effectiveModelId);
   };
 
   const handleCameraChange = (cameraId: string) => {
-    setUserCameraId(cameraId);
-    setJob((prev) => ({ ...prev, cameraId, status: 'idle', startedAt: undefined }));
+    setSelectedCameraId(cameraId);
+    configureJob({ cameraId });
   };
 
   const handleModelChange = (modelId: string) => {
     setSelectedModelId(modelId);
-    setJob((prev) => ({ ...prev, modelId, status: 'idle', startedAt: undefined }));
+    configureJob({ modelId });
   };
 
   return (

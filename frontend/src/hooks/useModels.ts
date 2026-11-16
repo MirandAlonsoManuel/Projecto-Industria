@@ -41,7 +41,11 @@ export function useModels(): UseModelsResult {
     isLoading,
     isError,
     refetch: refetchQuery,
-  } = useQuery({ queryKey: queryKeys.models, queryFn: getModels });
+  } = useQuery({
+    queryKey: queryKeys.models,
+    queryFn: getModels,
+    meta: { errorTitle: 'No se pudo cargar la lista de modelos' }, // T-036
+  });
 
   const models = data ?? EMPTY_MODELS;
   // Si hay datos en caché se siguen mostrando aunque el último refresco haya fallado.

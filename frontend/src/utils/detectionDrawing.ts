@@ -3,7 +3,8 @@
 // las cajas correspondan siempre al frame que se ve.
 import type { LocalizationDetection } from '../types';
 import { bboxToCanvas, computeBBoxTransform, computeContainFit, type Size } from './bboxTransform';
-import { colorForClass, labelTextColor } from './detectionColors';
+import type { AccuracyLevel } from '../store/detectionColorStore';
+import { colorForClass, labelTextColor, colorForConfidence } from './detectionColors';
 
 const LABEL_HEIGHT = 16;
 const LINE_WIDTH = 2;
@@ -48,7 +49,8 @@ export function redrawDetections(
   detections: LocalizationDetection[],
   frame: Size,
   display: Size,
-  sourceSize?: Size | null
+  sourceSize?: Size | null,
+  accuracyLevels?: AccuracyLevel[]
 ): void {
   if (display.width <= 0 || display.height <= 0) return;
   const ctx = prepareCanvas(canvas, display);
@@ -64,7 +66,9 @@ export function redrawDetections(
     const rect = bboxToCanvas(det.bbox, transform, fit);
     if (!rect) continue;
 
-    const color = colorForClass(det.classId);
+    const color = accuracyLevels
+      ? colorForConfidence(det.confidence, accuracyLevels)
+      : colorForClass(det.classId);
 
     // Caja de la detección
     ctx.strokeStyle = color;

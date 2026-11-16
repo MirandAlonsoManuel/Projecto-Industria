@@ -13,7 +13,11 @@ interface UseCamerasResult {
 const EMPTY_CAMERAS: ApiCamera[] = [];
 
 export function useCameras(): UseCamerasResult {
-  const { data, isError } = useQuery({ queryKey: queryKeys.cameras, queryFn: getCameras });
+  const { data, isError } = useQuery({
+    queryKey: queryKeys.cameras,
+    queryFn: getCameras,
+    meta: { errorTitle: 'No se pudo cargar la lista de cámaras' }, // T-036
+  });
 
   if (data) {
     const noCamerasDetected = data.total === 0;

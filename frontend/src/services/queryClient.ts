@@ -1,7 +1,23 @@
-import { QueryClient } from '@tanstack/react-query';
+import { MutationCache, QueryCache, QueryClient } from '@tanstack/react-query';
 import type { PersistedClient, Persister } from '@tanstack/react-query-persist-client';
 import { API_URL } from '../config';
 import { browserStorage } from './browserStorage';
+import {
+  isNetworkError,
+  notifyQueryError,
+  notifyQuerySuccess,
+  SERVER_TOAST_KEY,
+  type QueryErrorMeta,
+} from './errorNotifier';
+import { useToastStore } from '../store/toastStore';
+
+// T-036: tipa `meta` de las consultas (notify / errorTitle) en toda la app
+declare module '@tanstack/react-query' {
+  interface Register {
+    queryMeta: QueryErrorMeta;
+    mutationMeta: QueryErrorMeta;
+  }
+}
 
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -13,6 +29,26 @@ export const queryKeys = {
 } as const;
 
 export const queryClient = new QueryClient({
+  // T-036: un solo punto que notifica los errores de TODAS las consultas
+  queryCache: new QueryCache({
+    onError: (error, query) =>
+      notifyQueryError(error, query, () => {
+        void queryClient.refetchQueries({ queryKey: query.queryKey, exact: true });
+      }),
+    onSuccess: (_data, query) => notifyQuerySuccess(query),
+  }),
+  // Aún no hay mutaciones; cuando las haya, sus errores se notifican igual
+  mutationCache: new MutationCache({
+    onError: (error, _variables, _context, mutation) => {
+      if (mutation.meta?.notify === 'none') return;
+      useToastStore.getState().show({
+        key: isNetworkError(error) ? SERVER_TOAST_KEY : undefined,
+        severity: 'error',
+        title: mutation.meta?.errorTitle ?? 'No se pudo completar la operación',
+        message: error instanceof Error ? error.message : null,
+      });
+    },
+  }),
   defaultOptions: {
     queries: {
       // gcTime >= maxAge del persister, si no la caché restaurada se descarta antes de usarse

@@ -12,6 +12,8 @@ export function useLastInferenceEvent(): LastInferenceEvent | null {
     staleTime: Infinity,
     gcTime: Infinity,
     retry: false,
+    // T-036: lectura local del navegador; si falla, simplemente no hay último evento
+    meta: { notify: 'none' },
   });
   return data ?? null;
 }

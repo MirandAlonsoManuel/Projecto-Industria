@@ -1,9 +1,22 @@
 /**
  * T-27: useInferenceStream — accepts options for conf/iou/inferEveryNFrames/roi/modelId.
  * Reconnects when URL params change.
+ * HU-12: estado de la sesión y reconexión solo ante errores recuperables.
+ * T-035: publica onopen/onclose/onerror en el store global de conexión.
  */
-import { useState, useEffect, useRef } from 'react';
-import type { FrameMetadata, LocalizationDetection } from '../types';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import type { FrameMetadata, LocalizationDetection, StreamSessionStatus } from '../types';
+import {
+  CONNECTING_STATUS,
+  parseControlMessage,
+  shouldReconnect,
+  statusFromClose,
+} from '../utils/streamSession';
+import {
+  nextConnectionOwner,
+  useInferenceConnectionStore,
+} from '../store/inferenceConnectionStore';
+import type { WebSocketConnectionState } from './useCameraStream';
 import { parseFrameMetadata, splitFrameMessage } from '../utils/frameMetadata';
 import { WS_URL } from '../config';
 import {
@@ -14,6 +27,10 @@ import {
 
 const WS_BASE = `${WS_URL}/ws/inference-stream`;
 const NO_DETECTIONS: LocalizationDetection[] = [];
+/** Igual que en useCameraStream: tiempo máximo de caída antes de dejar de reintentar (2 min) */
+const MAX_RECONNECT_MS = 120_000;
+/** Tras este tiempo abierta, una conexión se considera sana y el siguiente corte reinicia la espera */
+const STABLE_CONNECTION_MS = 5_000;
 
 interface InferenceStreamOptions {
   modelId?: string;
@@ -30,7 +47,13 @@ interface UseInferenceStreamResult {
   /** Detecciones YOLO incrustadas en el frame más reciente (vacío si aún no llegan) */
   detections: LocalizationDetection[];
   isConnected: boolean;
+  /** Mismo significado que en useCameraStream: connecting / connected / reconnecting / disconnected */
+  connectionState: WebSocketConnectionState;
   error: string | null;
+  /** HU-12: estado de la sesión con código, descripción y si es recuperable */
+  session: StreamSessionStatus;
+  /** HU-12: vuelve a conectar a mano */
+  retry: () => void;
 }
 
 /** Frame y su metadata en un solo estado, para que nunca se rendericen desfasados */
@@ -68,6 +91,10 @@ export function useInferenceStream(
   const [current, setCurrent] = useState<CurrentFrame | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [session, setSession] = useState<StreamSessionStatus>(CONNECTING_STATUS);
+  const [connectionState, setConnectionState] = useState<WebSocketConnectionState>('connecting');
+  /** HU-12: incrementarlo vuelve a correr el efecto, es decir, reconecta desde cero */
+  const [attempt, setAttempt] = useState(0);
   const prevUrlRef = useRef<string | null>(null);
 
   // Serialize URL as dependency so we reconnect when any option changes
@@ -81,30 +108,52 @@ export function useInferenceStream(
   }, [cameraId, modelId, roi]);
 
   useEffect(() => {
+    // Propio de esta ejecución: los eventos de un socket viejo no tocan la conexión nueva
+    let disposed = false;
     let ws: WebSocket | null = null;
     let sequence = 0;
+    let backoff = 500;
+    /** Instante en que empezó la caída actual; null si el stream está sano */
+    let downSince: number | null = null;
+    let lastStatus: StreamSessionStatus = CONNECTING_STATUS;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // T-035: esta ejecución publica en el store con su propio id de dueño
+    const connection = useInferenceConnectionStore.getState();
+    const owner = nextConnectionOwner('inference');
 
-    const timer = setTimeout(() => {
-      ws = new WebSocket(wsUrl);
-      ws.binaryType = 'blob';
+    const updateSession = (status: StreamSessionStatus) => {
+      lastStatus = status;
+      setSession(status);
+    };
 
-      ws.onopen = () => {
+    function connect() {
+      if (disposed) return;
+      reconnectTimer = null;
+      const socket = new WebSocket(wsUrl);
+      socket.binaryType = 'blob';
+      ws = socket;
+      updateSession(CONNECTING_STATUS);
+      connection.socketConnecting(owner, 'inference');
+      /** Instante de apertura de ESTE socket; 0 si nunca abrió */
+      let openedAt = 0;
+
+      socket.onopen = () => {
+        if (disposed) return;
+        openedAt = Date.now();
         setIsConnected(true);
+        setConnectionState('connected');
         setError(null);
+        connection.socketOpened(owner);
       };
 
-      ws.onmessage = async (event: MessageEvent) => {
+      socket.onmessage = async (event: MessageEvent) => {
+        if (disposed) return;
         if (typeof event.data === 'string') {
-          try {
-            const handshake = JSON.parse(event.data) as {
-              connected: boolean;
-              description?: string;
-            };
-            if (!handshake.connected) {
-              setError(handshake.description ?? 'No se pudo iniciar el stream de inferencia.');
-            }
-          } catch {
-            // mensaje de texto no reconocido, se ignora
+          // HU-12: bienvenida, aviso de fin o error → estado de la sesión
+          const status = parseControlMessage(event.data);
+          if (status) {
+            updateSession(status);
+            setError(status.state === 'active' ? null : status.description);
           }
           return;
         }
@@ -112,6 +161,7 @@ export function useInferenceStream(
         if (!(event.data instanceof Blob)) return;
 
         const buffer = await event.data.arrayBuffer();
+        if (disposed) return;
         const { rawMeta, jpeg } = splitFrameMessage(buffer);
         const metadata = parseFrameMetadata(rawMeta, sequence++);
 
@@ -126,32 +176,84 @@ export function useInferenceStream(
         setCurrent({ url, metadata });
       };
 
-      ws.onerror = () => setError('Error en la conexión WebSocket de inferencia');
+      socket.onerror = () => {
+        if (disposed) return;
+        setError('Error en la conexión WebSocket de inferencia');
+        connection.socketErrored(owner, 'Error en la conexión WebSocket de inferencia');
+      };
 
-      ws.onclose = () => {
+      socket.onclose = (event: CloseEvent) => {
+        if (ws === socket) ws = null;
+        if (disposed) return;
         setIsConnected(false);
         // Desconexión: asegura que el último frame analizado quede guardado.
         flushLiveInferenceFrame();
         setCurrent(null);
+
+        // HU-12: el aviso previo del servidor (si lo hubo) decide si se reintenta
+        const final = statusFromClose(event.code, lastStatus);
+        updateSession(final);
+        setError(final.description);
+        if (!shouldReconnect(final)) {
+          setConnectionState('disconnected');
+          connection.socketClosed(owner, final, false);
+          return;
+        }
+        // Solo una conexión que se sostuvo un rato reinicia la espera; si falla recién
+        // abierta, la espera crece y al llegar al tope se deja de reintentar.
+        if (openedAt > 0 && Date.now() - openedAt >= STABLE_CONNECTION_MS) {
+          backoff = 500;
+          downSince = null;
+        }
+        // Mismo tope que useCameraStream: tras 2 min de caída se deja de reintentar
+        if (downSince === null) downSince = Date.now();
+        if (Date.now() - downSince >= MAX_RECONNECT_MS) {
+          setConnectionState('disconnected');
+          connection.socketClosed(owner, final, false);
+          return;
+        }
+        setConnectionState('reconnecting');
+        connection.socketClosed(owner, final, true);
+        reconnectTimer = setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, 30_000);
       };
+    }
+
+    // Arranca tras un tick (StrictMode safety)
+    const timer = setTimeout(() => {
+      setConnectionState('connecting');
+      connect();
     }, 0);
 
     return () => {
+      disposed = true;
+      connection.socketReleased(owner);
       clearTimeout(timer);
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       flushLiveInferenceFrame();
       if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+      ws = null;
       if (prevUrlRef.current) {
         URL.revokeObjectURL(prevUrlRef.current);
         prevUrlRef.current = null;
       }
     };
-  }, [wsUrl]);
+  }, [wsUrl, attempt]);
+
+  // HU-12: reconexión manual (tras un fin de sesión o un error no recuperable)
+  const retry = useCallback(() => {
+    setError(null);
+    setAttempt((n) => n + 1);
+  }, []);
 
   return {
     frameUrl: current?.url ?? null,
     frameMetadata: current?.metadata ?? null,
     detections: current?.metadata.detections ?? NO_DETECTIONS,
     isConnected,
+    connectionState,
     error,
+    session,
+    retry,
   };
 }

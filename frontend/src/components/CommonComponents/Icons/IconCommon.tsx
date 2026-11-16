@@ -151,8 +151,8 @@ export function DeleteX(){
   return(
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
       <g clip-path="url(#clip0_552_32)">
-      <path d="M9 3L3 9" stroke="#E29F9C" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M3 3L9 9" stroke="#E29F9C" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M9 3L3 9" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M3 3L9 9" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
       </g>
       <defs>
       <clipPath id="clip0_552_32">
@@ -166,6 +166,43 @@ export function DeleteX(){
 export function InspectIcon(){
   return(
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-zoom-scan"><path stroke="none" d="M0 0h24v24H0z" fill="none" /><path d="M8 11a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /><path d="M16 16l-2.5 -2.5" /><path d="M3 7v-2a2 2 0 0 1 2 -2h2" /><path d="M3 17v2a2 2 0 0 0 2 2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M17 21h2a2 2 0 0 0 2 -2v-2" /></svg>
+  )
+}
+
+export function DeleteXMenu(){
+  return(
+    <svg width="19" height="19" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g clip-path="url(#clip0_552_32)">
+      <path d="M9 3L3 9" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M3 3L9 9" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+      <defs>
+      <clipPath id="clip0_552_32">
+      <rect width="19" height="19" fill="white"/>
+      </clipPath>
+      </defs>
+    </svg>
+  )
+}
+
+export function CheckIcon(){
+  return(
+    <svg width="19" height="19" viewBox="0 0 19 19" fill="none" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <g clip-path="url(#clip0_642_274)">
+      <use xlink:href="#stroke0_642_274" fill="white"/>
+      <mask id="stroke1_642_274" fill="white">
+      <use xlink:href="#stroke0_642_274"/>
+      </mask>
+      <path d="M16.3929 4.98191C16.5413 5.13037 16.6247 5.3317 16.6247 5.54162C16.6247 5.75154 16.5413 5.95287 16.3929 6.10133L8.47625 14.018C8.32779 14.1664 8.12646 14.2498 7.91654 14.2498C7.70662 14.2498 7.50529 14.1664 7.35683 14.018L3.3985 10.0597C3.25429 9.91035 3.1745 9.71038 3.1763 9.5028C3.1781 9.29523 3.26136 9.09667 3.40814 8.94989C3.55493 8.80311 3.75348 8.71985 3.96106 8.71804C4.16863 8.71624 4.36861 8.79604 4.51792 8.94025L7.91654 12.3389L15.2735 4.98191C15.422 4.8335 15.6233 4.75012 15.8332 4.75012C16.0431 4.75012 16.2445 4.8335 16.3929 4.98191Z" stroke-width="2" stroke="#FFFFFF" mask="url(#stroke1_642_274)"/>
+      </g>
+      <defs>
+      <clipPath id="clip0_642_274">
+      <rect width="19" height="19" fill="white"/>
+      </clipPath>
+      <path id="stroke0_642_274" d="M16.3929 4.98191C16.5413 5.13037 16.6247 5.3317 16.6247 5.54162C16.6247 5.75154 16.5413 5.95287 16.3929 6.10133L8.47625 14.018C8.32779 14.1664 8.12646 14.2498 7.91654 14.2498C7.70662 14.2498 7.50529 14.1664 7.35683 14.018L3.3985 10.0597C3.25429 9.91035 3.1745 9.71038 3.1763 9.5028C3.1781 9.29523 3.26136 9.09667 3.40814 8.94989C3.55492 8.80311 3.75348 8.71985 3.96106 8.71804C4.16863 8.71624 4.36861 8.79604 4.51792 8.94025L7.91654 12.3389L15.2735 4.98191C15.422 4.8335 15.6233 4.75012 15.8332 4.75012C16.0431 4.75012 16.2445 4.8335 16.3929 4.98191Z"/>
+      </defs>
+    </svg>
+
   )
 }
 

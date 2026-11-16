@@ -4,10 +4,12 @@ import type { CameraConnectionStatus, Job } from '../../types/indexTypes';
 import { ButtonCommon } from '../CommonComponents/Button/ButtonCommon';
 import { CameraSparklesIcon, InspectIcon } from '../CommonComponents/Icons/IconCommon.tsx';
 import type { Camera, Model } from '../../types/index';
+import { connectionBadge, useInferenceConnectionStore } from '../../store/inferenceConnectionStore';
 
 interface TopBarProps {
   title: string;
   onSettings?: () => void;
+  /** Ya no se usa: el estado sale del store de conexión WS (T-035) */
   status?: CameraConnectionStatus;
   cameraName?: string;
   rightSlot?: ReactNode;
@@ -30,15 +32,24 @@ function InfoRow({ label, value }: { label: string; value: string }) {
  * Sustituye el header inline de MainPanel para que el indicador
  * de estado sea un componente propio y reutilizable.
  */
-export function TopBar({status, cameraName, job, onToggleInspection}: TopBarProps) {
+export function TopBar({cameraName, job, onToggleInspection}: TopBarProps) {
   const isInspectionRunning = job.status === 'running';
-  const resolvedStatus = status ?? 'disconnected';
   const resolvedCameraName = cameraName ?? '';
+  // T-035: estado derivado de los eventos del WebSocket, sin polling REST
+  const wsStatus = useInferenceConnectionStore((s) => s.status);
+  const wsAttempt = useInferenceConnectionStore((s) => s.attempt);
+  const wsLastError = useInferenceConnectionStore((s) => s.lastError);
+  const badge = connectionBadge({ status: wsStatus, attempt: wsAttempt, lastError: wsLastError });
 
   return (
     <header
       className="w-full flex justify-between shrink-0 items-center gap-4 bg-transparent" role="banner">
-      <ConnectionStatusBadge status={resolvedStatus} cameraName={resolvedCameraName}/>
+      <ConnectionStatusBadge
+        status={badge.status}
+        label={badge.label}
+        detail={badge.detail}
+        cameraName={resolvedCameraName}
+      />
       <div className='flex gap-1.5'>
         <ButtonCommon
             size="large"
@@ -55,7 +66,12 @@ export function TopBar({status, cameraName, job, onToggleInspection}: TopBarProp
           aria-pressed={isInspectionRunning}
           icon={<InspectIcon/>}
         >
-          Iniciar inspección
+          {/* T-036: el texto refleja el estado del job */}
+          {isInspectionRunning
+            ? 'Detener inspección'
+            : job.status === 'error'
+              ? 'Reintentar inspección'
+              : 'Iniciar inspección'}
         </ButtonCommon>
       </div>
     </header>

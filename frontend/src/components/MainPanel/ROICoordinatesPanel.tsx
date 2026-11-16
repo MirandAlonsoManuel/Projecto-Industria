@@ -105,7 +105,7 @@ export function ROICoordinatesPanel({
                       onClick={() => deleteROI(roi.id)}
                       title="Eliminar zona"
                       className="ml-4 flex items-center justify-center rounded
-                                text-[#9aa3af] hover:text-[#d64545] hover:bg-[rgba(214,69,69,0.08)]
+                                text-[#E29F9C] hover:text-[#d64545] hover:bg-[rgba(214,69,69,0.08)]
                                 transition-colors text-[14px] leading-none p-0.5"
                     >
                       <DeleteX></DeleteX>
