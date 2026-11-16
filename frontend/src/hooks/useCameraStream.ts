@@ -413,6 +413,13 @@ export function useCameraStream(
 
     // Start initial connection after a tick (StrictMode safety)
     const initTimer = setTimeout(() => {
+      // HU-11: al cambiar de URL (Iniciar / Detener inspección) el backend cierra y vuelve a
+      // abrir la cámara, y eso tarda. Sin esto la pantalla conservaba el último frame y
+      // parecía congelada; se limpia mientras StreamSessionNotice muestra "Conectando…".
+      const canvas = canvasRef.current;
+      canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+      setIsConnected(false);
+      setFrameMetadata(null);
       setConnectionState('connecting');
       connect();
     }, 0);

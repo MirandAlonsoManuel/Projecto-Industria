@@ -1,8 +1,10 @@
 import type { Camera, Job } from '../../types/index';
 import type { ApiModel } from '../../types';
 import { useCameraStream } from '../../hooks/useCameraStream';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useROIStore } from '../../store/roiStore';
+import type { NormalizedROI } from '../../utils/roiUtils';
+import { nextSnapshot, type Snapshot } from '../../utils/roiSnapshot';
 import { ButtonCommon } from '../CommonComponents';
 import { ROICanvas } from './ROICanvas';
 import { TopBar } from '../Toolbar';
@@ -83,21 +85,32 @@ export function LiveViewer({
   const isDetectionModel = jobModel?.task === 'localization';
   const isLiveInference = isInspectionRunning && isDetectionModel;
 
+  // HU-11: el ROI va en la URL del WebSocket, así que moverlo durante la inspección
+  // reconectaba el stream en cada cambio. Se fija al iniciar; los cambios aplican al
+  // siguiente inicio. Se ajusta durante el render (patrón de React) para no mostrar un
+  // render intermedio con el ROI sin fijar.
+  const [roiSnapshot, setRoiSnapshot] = useState<Snapshot<NormalizedROI | null>>(null);
+  const nextRoiSnapshot = nextSnapshot(roiSnapshot, isLiveInference, streamRoi);
+  if (nextRoiSnapshot !== roiSnapshot) {
+    setRoiSnapshot(nextRoiSnapshot);
+  }
+  const inferenceRoi = nextRoiSnapshot ? nextRoiSnapshot.value : streamRoi;
+
   const streamOptions = useMemo(
     () =>
       isLiveInference
         ? {
             mode: 'inference' as const,
             modelId: job.modelId,
-            roi: streamRoi,
+            roi: inferenceRoi,
           }
         : {
             mode: 'stream' as const,
           },
-    [isLiveInference, job.modelId, streamRoi]
+    [isLiveInference, job.modelId, inferenceRoi]
   );
 
-  const { canvasRef, detectionCanvasRef, displaySize, session, connectionState, retry } =
+  const { canvasRef, detectionCanvasRef, displaySize, naturalSize, session, connectionState, retry } =
     useCameraStream(cameraId, streamOptions);
 
   return (
@@ -163,8 +176,8 @@ export function LiveViewer({
       {activeItem &&(
         <MenuOptions
           cameraId={cameraId}
-          naturalWidth={naturalWidth}
-          naturalHeight={naturalHeight}
+          naturalWidth={naturalSize?.width ?? naturalWidth}
+          naturalHeight={naturalSize?.height ?? naturalHeight}
           menuOptionSelected={activeItem}
         />
       )}
