@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 from pathlib import Path
 from threading import RLock
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRegistryError(ValueError):
@@ -19,7 +22,9 @@ class ModelRegistry:
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if not self._path.exists():
-            raise ModelRegistryError(f"No existe el registro de modelos: {self._path}")
+            # La ruta es información interna: va al log, no al mensaje.
+            logger.error("No existe el registro de modelos: %s", self._path)
+            raise ModelRegistryError("No existe el registro de modelos.")
         data = json.loads(self._path.read_text(encoding="utf-8"))
         models = data.get("models", [])
         result: dict[str, dict[str, Any]] = {}

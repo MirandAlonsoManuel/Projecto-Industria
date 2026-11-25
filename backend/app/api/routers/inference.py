@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket
+from fastapi import APIRouter, File, Query, UploadFile, WebSocket
 
+from app.api.http_errors import to_http_error as _http_error
 from app.schemas.inference import (
     AnomalyResponse,
     ClassificationResponse,
@@ -11,21 +12,14 @@ from app.schemas.inference import (
 )
 from app.services.camera_session_manager import camera_session_manager
 from app.services.image_service import ImageInputError, decode_image, resolve_roi_request, roi_points
-from app.services.inference_service import InferenceError, inference_service
+from app.services.inference_lifecycle import inference_lifecycle
+from app.services.inference_service import inference_service
 from app.services.detections import normalize_detections
-from app.services.model_registry import ModelRegistryError
+from app.services.model_status import with_engine_status
 from app.services.stream_control import RoiOutOfFrame, StreamControl
 from app.services.stream_runner import INFERENCE_TIMEOUT_S, serve_camera_stream
 
 router = APIRouter(tags=["inference"])
-
-
-def _http_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, (ImageInputError, ModelRegistryError)):
-        return HTTPException(status_code=400, detail=str(exc))
-    if isinstance(exc, InferenceError):
-        return HTTPException(status_code=503, detail=str(exc))
-    return HTTPException(status_code=500, detail=str(exc))
 
 
 def _roi_query(
@@ -41,7 +35,8 @@ def _roi_query(
 
 @router.get("/models", response_model=list[ModelInfo])
 def list_models() -> list[dict]:
-    return inference_service.list_models()
+    # Además de cada modelo, informa si el motor está listo, apagado o en error.
+    return with_engine_status(inference_service.list_models(), inference_lifecycle.get_status())
 
 
 @router.post("/inference/localization", response_model=LocalizationResponse)

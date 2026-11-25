@@ -13,7 +13,17 @@ from app.services.model_registry import ModelRegistry, ModelRegistryError
 
 
 class InferenceError(RuntimeError):
-    pass
+    """Fallo del lado del servidor (carga o ejecución del modelo): HTTP 503."""
+
+
+class InferenceRequestError(InferenceError):
+    """
+    La petición del cliente es inválida (p. ej. modelo de otra tarea, imágenes
+    de distinto tamaño): HTTP 400.
+
+    Hereda de `InferenceError` para no romper código que ya la capture, pero el
+    router la distingue y la responde como error del cliente (BUG-09).
+    """
 
 
 class InferenceService:
@@ -25,7 +35,7 @@ class InferenceService:
     def _resolve(self, task: str, model_id: str | None) -> dict[str, Any]:
         model = self.registry.get(model_id) if model_id else self.registry.default_for(task)
         if model.get("task") != task:
-            raise InferenceError(f"El modelo {model['id']} no corresponde a la tarea {task}.")
+            raise InferenceRequestError(f"El modelo {model['id']} no corresponde a la tarea {task}.")
         return model
 
     def _load_model(self, spec: dict[str, Any]) -> Any:
@@ -221,7 +231,7 @@ class InferenceService:
         if spec["backend"] != "reference_diff":
             raise InferenceError("El modelo seleccionado requiere un runtime entrenado no configurado.")
         if image.shape[:2] != reference.shape[:2]:
-            raise InferenceError("La imagen y la referencia deben tener el mismo tamaño.")
+            raise InferenceRequestError("La imagen y la referencia deben tener el mismo tamaño.")
         value = int(threshold if threshold is not None else config.get("threshold", 25))
         min_area = int(config.get("min_area", 64))
         target_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)

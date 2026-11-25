@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
+from app.api.middleware import MaxBodySizeMiddleware
 from app.api.routers import health, inference
 from app.api.routers import stream, cameras
 from app.services.camera_session_manager import camera_session_manager
@@ -91,6 +92,15 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         version=settings.version_api,
         lifespan=lifespan,
+    )
+
+    # Límite de tamaño de subida. Se registra ANTES que CORS para que CORS quede
+    # como capa externa y la respuesta 413 también lleve los encabezados CORS
+    # (si no, el navegador mostraría un error de CORS en lugar del 413).
+    app.add_middleware(
+        MaxBodySizeMiddleware,
+        max_bytes=settings.max_upload_bytes,
+        path_prefixes=("/inference",),
     )
 
     app.add_middleware(

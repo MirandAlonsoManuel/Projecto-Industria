@@ -79,3 +79,7 @@ class ModelInfo(BaseModel):
     available: bool
     loaded: bool
     config: dict[str, Any] = Field(default_factory=dict)
+    # Estado del motor de inferencia (ciclo de vida E02). Ver model_status.py.
+    engine_state: str = "unknown"
+    engine_ready: bool = False
+    engine_error: str | None = None

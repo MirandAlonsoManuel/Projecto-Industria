@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     ws_max_queue_size: int = 5
     max_cameras: int = 4
 
+    # Subida de imágenes (REST): tamaño máximo de UNA imagen, en bytes
+    # (por defecto 25 MiB). Se aplica en MaxBodySizeMiddleware. Variable de
+    # entorno: MAX_UPLOAD_BYTES.
+    max_upload_bytes: int = 25 * 1024 * 1024
+
     # Identificador de la única cámara configurada para el alcance
     # vigente del proyecto (ver E05: DetectionResult.camera_id debe
     # coincidir con este valor).
